@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     firebase_project_id: str = "demo-amazego"
     firestore_emulator_host: str | None = None
     google_application_credentials: str | None = None
+    firebase_service_account_json: SecretStr | None = None
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
     levels_dir: Path = ROOT / "data" / "levels"
     admin_username: str = "admin"

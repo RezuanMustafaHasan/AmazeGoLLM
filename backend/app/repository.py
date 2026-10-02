@@ -11,7 +11,7 @@ from threading import RLock
 from uuid import uuid4
 
 import firebase_admin
-from firebase_admin import firestore
+from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 from backend.app.config import Settings
@@ -266,8 +266,15 @@ class FirestoreRepository(GitCatalog):
             os.environ["FIRESTORE_EMULATOR_HOST"] = settings.firestore_emulator_host
         elif settings.firebase_project_id.startswith("demo-"):
             raise RuntimeError("Set FIRESTORE_EMULATOR_HOST or a real FIREBASE_PROJECT_ID in .env")
+        credential = None
+        if settings.firebase_service_account_json:
+            credential = credentials.Certificate(
+                json.loads(settings.firebase_service_account_json.get_secret_value())
+            )
         self.app = firebase_admin.initialize_app(
-            options={"projectId": settings.firebase_project_id}, name=f"amaze-{uuid4()}"
+            credential=credential,
+            options={"projectId": settings.firebase_project_id},
+            name=f"amaze-{uuid4()}",
         )
         self.db = firestore.client(app=self.app)
         self.root = self.db.collection("amaze_go").document("v1")

@@ -323,7 +323,45 @@ test player's completed attempt in Firestore.
 
 ## Deployment
 
-The site has not been publicly deployed. A single Docker container can serve both
+### Vercel
+
+The repository includes a FastAPI Vercel preset and a build command that builds
+React into `dist/`. FastAPI serves the frontend and `/api` from the same origin;
+leave `VITE_API_BASE_URL` unset and do not override the Output Directory to `dist`.
+
+Import the GitHub repository into Vercel with the repository root as the Root
+Directory and FastAPI as the Framework Preset. Leave the default Python install
+step enabled; the configured build command installs the frontend dependencies.
+Select a Node version supported by Vite (Node 22.12+ or 24).
+
+Set these server environment variables for each deployment environment you use:
+
+| Variable | Value |
+| --- | --- |
+| `STORAGE_BACKEND` | `firestore` |
+| `FIREBASE_PROJECT_ID` | Your Firebase project ID, currently `amazego-llm-2026`. |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | Complete JSON from a Firebase service-account private key. |
+| `ADMIN_USERNAME` | Your configured admin username. |
+| `ADMIN_PASSWORD_HASH` | The configured scrypt hash from your private `.env`. |
+| `ADMIN_SESSION_SECRET` | The configured signing secret from your private `.env`. |
+
+Keep credential values in Vercel's secret environment settings. Do not add
+`FIRESTORE_EMULATOR_HOST`, a Mac credential path, or a `VITE_`-prefixed credential
+variable. If importing a private `.env.vercel` file, it is ignored by Git.
+
+In the Vercel project's **Settings > Git**, enable **Git Large File Storage
+(LFS)**, then redeploy. The level catalog uses LFS and must contain the actual
+JSON files instead of pointer files. An initial deployment before enabling LFS
+can fail to start; the redeployment picks up the complete catalog.
+
+Check `/api/health` on the deployment: it should report `status: "ok"`,
+`storage: "firestore"`, and `emulator: false`. Play a level and reload to check
+saved progress; `/admin` uses the configured admin login. Local tests use memory
+storage; the deployed service-account permissions must be checked on Vercel.
+
+### Docker
+
+A single Docker container can serve both
 the built React app and FastAPI on port 8000, avoiding cross-origin configuration:
 
 ```sh
