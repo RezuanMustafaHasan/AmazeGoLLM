@@ -189,22 +189,32 @@ def test_gateway_http_errors_are_distinguished_without_secret_leaks(health_app, 
     assert result.json()["status"] == "error"
     assert result.json()["error"]["code"] == code
     assert result.json()["error"]["http_status"] == status
+    if status == 403:
+        assert "Discover model IDs" in result.json()["error"]["message"]
     assert "private-ufl-test-key" not in result.text
     assert len(requests) == 1  # Do not retry a billable check.
 
 
 @pytest.mark.parametrize(
-    ("exception", "code"),
+    ("exception", "code", "transport_error"),
     [
-        (httpx.ReadTimeout("private-ufl-test-key"), "timeout"),
-        (httpx.ConnectError("private-ufl-test-key"), "connection_error"),
+        (httpx.ReadTimeout("private-ufl-test-key"), "timeout", None),
+        (httpx.ConnectError("private-ufl-test-key"), "connection_error", "connect_error"),
+        (
+            httpx.RemoteProtocolError("private-ufl-test-key"),
+            "connection_error",
+            "remote_protocol_error",
+        ),
+        (httpx.ReadError("private-ufl-test-key"), "connection_error", "read_error"),
+        (httpx.DecodingError("private-ufl-test-key"), "connection_error", "decoding_error"),
     ],
 )
-def test_timeout_and_network_errors(health_app, exception, code):
+def test_timeout_and_network_errors(health_app, exception, code, transport_error):
     client, _, requests, reply, _ = health_app
     reply["exception"] = exception
     result = check(client, login(client))
     assert result.json()["error"]["code"] == code
+    assert result.json()["error"].get("transport_error") == transport_error
     assert "private-ufl-test-key" not in result.text and len(requests) == 1
 
 

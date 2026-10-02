@@ -232,9 +232,9 @@ UFL_BASE_URL=https://api.ai.it.ufl.edu
 
 The base URL is used as supplied, including any configured path; the app does not
 append `/v1`. No separate OpenAI, Anthropic, or Gemini key is needed. The seven
-presets are `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra`, `opus-5`, `opus-5.5`,
-`fable-5.1`, and `gemini-3.8-flash`. These are requested gateway aliases, not a
-claim that the key has access to them. Gemini's preset ID is inferred from its
+presets are `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra`, `opus-5`, `claude-opus-5.5`,
+`fable-5.1`, and `gemini-3.8-flash`. These presets do not guarantee that the key
+has access to them. Gemini's preset ID is inferred from its
 display name; use the exact ID reported by UFL if it differs. Model IDs remain
 editable, and existing runs also route through UFL.
 
@@ -268,7 +268,10 @@ Loading the page does not call the gateway. **Discover model IDs** reads UFL's
 **Text response** sends a short prompt and validates non-empty completion content
 and the expected reply. **Image response** attaches a blue PNG and checks the
 reported color. Each result shows response text, returned model, finish reason,
-latency, token usage when supplied, and safe failure diagnostics. A warning means
+latency, token usage when supplied, and safe failure diagnostics, including a
+transport error category when available. A 403 can indicate an incorrect alias
+or missing model access; discovery flags preset IDs absent from the key's model
+list. A warning means
 text was returned but the expected reply did not finish correctly. Image checks
 confirm a basic image request; they do not measure puzzle-solving quality.
 

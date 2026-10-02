@@ -21,7 +21,7 @@ MODEL_PRESETS = [
     {"id": "gpt-6.1-sol", "label": "GPT-6.1 Sol"},
     {"id": "gpt-6-astra", "label": "GPT-6 Astra"},
     {"id": "opus-5", "label": "Opus 5"},
-    {"id": "opus-5.5", "label": "Opus 5.5"},
+    {"id": "claude-opus-5.5", "label": "Opus 5.5"},
     {"id": "fable-5.1", "label": "Fable 5.1"},
     {"id": "gemini-3.8-flash", "label": "Gemini 3.8 Flash"},
 ]
@@ -114,16 +114,36 @@ def safe_error(error):
     if isinstance(error, APITimeoutError):
         return {"code": "timeout", "message": "UFL did not respond before the timeout."}
     if isinstance(error, APIConnectionError):
-        return {
+        diagnostic = {
             "code": "connection_error",
-            "message": "Could not connect to UFL. Check UFL_BASE_URL and network access.",
+            "message": "The UFL request failed at the HTTP transport layer. "
+            "Retry this model or check gateway connectivity.",
         }
+        # Only expose a known category, never the cause's message, body, or headers.
+        transport_errors = {
+            "ConnectError": "connect_error",
+            "ReadError": "read_error",
+            "WriteError": "write_error",
+            "RemoteProtocolError": "remote_protocol_error",
+            "LocalProtocolError": "local_protocol_error",
+            "DecodingError": "decoding_error",
+            "ProxyError": "proxy_error",
+            "UnsupportedProtocol": "unsupported_protocol",
+        }
+        transport_error = transport_errors.get(type(error.__cause__).__name__)
+        if transport_error:
+            diagnostic["transport_error"] = transport_error
+        return diagnostic
     if isinstance(error, APIStatusError):
         status = error.status_code
         code, message = {
             400: ("bad_request", "UFL rejected the request. Check the model ID and input support."),
             401: ("authentication_error", "UFL rejected the API key. Check UFL_API_KEY."),
-            403: ("permission_denied", "The UFL key does not have access to this model."),
+            403: (
+                "permission_denied",
+                "UFL rejected this model ID for the API key. Discover model IDs to check "
+                "the exact alias and available models, or confirm access with UFL.",
+            ),
             404: ("not_found", "Model or endpoint not found. Check the model ID and UFL_BASE_URL."),
             429: ("rate_limited", "UFL rate limit or quota exceeded. Retry later or check quota."),
         }.get(status, ("upstream_error", "UFL returned an unsuccessful HTTP response."))

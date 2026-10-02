@@ -18,6 +18,7 @@ interface Diagnostic {
   code: string
   message: string
   http_status?: number
+  transport_error?: string
 }
 interface Result {
   model: string
@@ -330,6 +331,9 @@ export default function ApiHealth({ request }: { request: Request }) {
                     {result.error && (
                       <p className={`health-diagnostic ${result.status}`}>{result.error.message}</p>
                     )}
+                    {result.error?.transport_error && (
+                      <p className="admin-muted">HTTP transport: {result.error.transport_error}</p>
+                    )}
                     {result.response !== null && (
                       <pre>
                         {result.response}
@@ -337,6 +341,12 @@ export default function ApiHealth({ request }: { request: Request }) {
                       </pre>
                     )}
                   </div>
+                )}
+                {discovered && !discovered.includes(model.id) && (
+                  <p className="health-diagnostic warning">
+                    This ID is not listed for your key. Choose an exact gateway ID from the
+                    discovered list or confirm this alias with UFL.
+                  </p>
                 )}
               </article>
             )
