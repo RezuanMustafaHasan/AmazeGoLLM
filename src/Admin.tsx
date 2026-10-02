@@ -15,11 +15,15 @@ import {
   ShieldCheck,
   Trash2,
   X,
+  Bot,
+  Activity,
 } from 'lucide-react'
 import type { LevelProgress } from './types'
+import Agents from './Agents'
+import ApiHealth from './ApiHealth'
 import './admin.css'
 
-type Screen = 'overview' | 'players' | 'sessions'
+type Screen = 'overview' | 'players' | 'sessions' | 'agents' | 'api-health'
 interface Auth {
   username: string
   csrf_token: string
@@ -105,7 +109,7 @@ export default function Admin() {
       const response = await fetch(`/api/admin${path}`, {
         ...options,
         credentials: 'same-origin',
-        signal: AbortSignal.timeout(30000),
+        signal: options.signal ?? AbortSignal.timeout(30000),
         headers: {
           'Content-Type': 'application/json',
           ...(auth ? { 'X-Admin-CSRF': auth.csrf_token } : {}),
@@ -460,6 +464,18 @@ export default function Admin() {
         <p className="admin-eyebrow">WORKSPACE</p>
         <nav aria-label="Admin navigation">
           <button
+            className={screen === 'agents' ? 'selected' : ''}
+            onClick={() => navigate('agents')}
+          >
+            <Bot size={18} /> LLM agents
+          </button>
+          <button
+            className={screen === 'api-health' ? 'selected' : ''}
+            onClick={() => navigate('api-health')}
+          >
+            <Activity size={18} /> API health
+          </button>
+          <button
             className={screen === 'overview' ? 'selected' : ''}
             onClick={() => navigate('overview')}
           >
@@ -500,7 +516,8 @@ export default function Admin() {
       <main className="admin-main">
         <header className="admin-topbar">
           <span>
-            Administration <ChevronRight size={14} /> {screen[0].toUpperCase() + screen.slice(1)}
+            Administration <ChevronRight size={14} />{' '}
+            {screen === 'api-health' ? 'API health' : screen[0].toUpperCase() + screen.slice(1)}
           </span>
           <span className="admin-connection">
             <i /> Connected
@@ -515,14 +532,22 @@ export default function Admin() {
                   ? 'Your game, at a glance.'
                   : screen === 'players'
                     ? 'Players'
-                    : 'Game sessions'}
+                    : screen === 'agents'
+                      ? 'LLM agents'
+                      : screen === 'api-health'
+                        ? 'API health'
+                        : 'Game sessions'}
               </h1>
               <p className="admin-muted">
                 {screen === 'overview'
                   ? 'A live view of player activity and saved attempts.'
                   : screen === 'players'
                     ? 'Inspect progress and manage player records.'
-                    : 'Review attempts, outcomes, and action history.'}
+                    : screen === 'agents'
+                      ? 'Run visual puzzle evaluations and inspect every decision.'
+                      : screen === 'api-health'
+                        ? 'Verify your UFL connection with real model responses.'
+                        : 'Review attempts, outcomes, and action history.'}
               </p>
             </div>
             <button className="admin-secondary" onClick={() => void reload()} disabled={busy}>
@@ -599,7 +624,9 @@ export default function Admin() {
               </p>
             </>
           )}
-          {screen !== 'overview' && (
+          {screen === 'agents' && <Agents request={request} />}
+          {screen === 'api-health' && <ApiHealth request={request} />}
+          {(screen === 'players' || screen === 'sessions') && (
             <div className="admin-card">
               <div className="admin-list-toolbar">
                 <div className="admin-search">

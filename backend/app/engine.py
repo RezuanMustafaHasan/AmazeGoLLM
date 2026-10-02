@@ -58,7 +58,13 @@ def solution(level: Level) -> list[int]:
 
 
 def new_session(
-    session_id: str, player_id: str, level: Level, actor_type: str, actor_name: str | None
+    session_id: str,
+    player_id: str,
+    level: Level,
+    actor_type: str,
+    actor_name: str | None,
+    *,
+    max_lives: int | None = None,
 ) -> dict:
     return {
         "id": session_id,
@@ -69,7 +75,8 @@ def new_session(
         "actor_type": actor_type,
         "actor_name": actor_name,
         "status": "active",
-        "lives_remaining": level.lives,
+        "lives_remaining": max_lives if max_lives is not None else level.lives,
+        "max_lives": max_lives if max_lives is not None else level.lives,
         "moves": 0,
         "mistakes": 0,
         "removed_ids": [],
@@ -92,7 +99,7 @@ def observation(session: dict) -> dict:
         "level": level.summary(),
         "status": session["status"],
         "lives_remaining": session["lives_remaining"],
-        "max_lives": level.lives,
+        "max_lives": session.get("max_lives", level.lives),
         "moves": session["moves"],
         "mistakes": session["mistakes"],
         "hints_used": session["hints_used"],
@@ -164,6 +171,45 @@ def apply_action(
                 outcome["reward"] = 10
     updated["revision"] += 1
     updated["updated_at"] = now_iso()
+    updated["history"].append(
+        {
+            "action_id": action_id,
+            **action,
+            **outcome,
+            "revision": updated["revision"],
+            "at": updated["updated_at"],
+        }
+    )
+    updated["receipts"][action_id] = {"action": action, "outcome": outcome}
+    return updated, outcome
+
+
+def apply_agent_error(session, *, action_id, expected_revision, message):
+    """A model-produced invalid action is a scored mistake, with retry receipts."""
+    action = {"type": "invalid", "arrow_id": None, "message": message}
+    previous = session["receipts"].get(action_id)
+    if previous:
+        if previous["action"] != action:
+            raise GameError("action_id was already used for a different action")
+        return session, previous["outcome"]
+    if expected_revision != session["revision"] or session["status"] != "active":
+        raise GameError("The agent state changed before its action was applied.")
+    updated = deepcopy(session)
+    updated["moves"] += 1
+    updated["mistakes"] += 1
+    updated["lives_remaining"] -= 1
+    updated["revision"] += 1
+    updated["updated_at"] = now_iso()
+    if updated["lives_remaining"] == 0:
+        updated["status"] = "lost"
+        updated["completed_at"] = updated["updated_at"]
+    outcome = {
+        "result": "invalid",
+        "arrow_id": None,
+        "blocked_by": None,
+        "reward": -1,
+        "message": message,
+    }
     updated["history"].append(
         {
             "action_id": action_id,

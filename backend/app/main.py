@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from google.api_core.exceptions import GoogleAPICallError
 
 from backend.app.admin import admin_router
+from backend.app.agents import AgentRunner
 from backend.app.catalog import load_levels
 from backend.app.config import ROOT, Settings
 from backend.app.engine import GameError, apply_action, new_session, observation
@@ -27,6 +28,7 @@ def create_app(settings: Settings | None = None, repository=None):
         store = repository or build_repository(settings)
         store.set_catalog(load_levels(settings.levels_dir))
         app.state.store = store
+        app.state.agents = AgentRunner(store, settings)
         yield
         store.close()
 

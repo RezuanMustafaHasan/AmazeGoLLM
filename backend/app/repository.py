@@ -14,6 +14,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 
+from backend.app.agent_store import FirestoreAgentStore, MemoryAgentStore
 from backend.app.config import Settings
 from backend.app.engine import GameError, now_iso, update_progress
 from backend.app.models import Level
@@ -139,7 +140,7 @@ class GitCatalog:
         return {**{key: session[key] for key in keys}, "action_count": len(session["history"])}
 
 
-class MemoryRepository(GitCatalog):
+class MemoryRepository(GitCatalog, MemoryAgentStore):
     """Explicit opt-in for tests; uses the same board-free stored session format."""
 
     mode = "memory"
@@ -148,6 +149,8 @@ class MemoryRepository(GitCatalog):
         self.catalog: dict[str, Level] = {}
         self.players: dict[str, dict] = {}
         self.sessions: dict[str, dict] = {}
+        self.agent_runs: dict[str, dict] = {}
+        self.agent_turns: dict[tuple[str, str], dict] = {}
         self.lock = RLock()
 
     def create_player(self):
@@ -230,6 +233,11 @@ class MemoryRepository(GitCatalog):
             session = self.sessions.get(session_id)
             if not session:
                 raise GameError("Session not found", 404)
+            if self.agent_runs_for_player(session["player_id"]):
+                raise GameError(
+                    "This attempt belongs to an agent evaluation. Delete its player "
+                    "to remove the evaluation and its attempts together."
+                )
             player = self.players.get(session["player_id"])
             if player:
                 remaining = [
@@ -249,13 +257,14 @@ class MemoryRepository(GitCatalog):
             for key in sessions:
                 del self.sessions[key]
             del self.players[player_id]
+            self.remove_agent_records_for_player(player_id)
             return {"deleted_players": 1, "deleted_sessions": len(sessions)}
 
     def close(self):
         pass
 
 
-class FirestoreRepository(GitCatalog):
+class FirestoreRepository(GitCatalog, FirestoreAgentStore):
     mode = "firestore"
 
     def __init__(self, settings: Settings):
@@ -280,6 +289,7 @@ class FirestoreRepository(GitCatalog):
         self.root = self.db.collection("amaze_go").document("v1")
         self.players = self.root.collection("players")
         self.sessions = self.root.collection("sessions")
+        self.agent_runs = self.root.collection("agent_runs")
 
     def create_player(self):
         token, player = player_credentials()
@@ -375,6 +385,12 @@ class FirestoreRepository(GitCatalog):
 
     def delete_session(self, session_id):
         ref = self.sessions.document(session_id)
+        current = read_document(ref.get(timeout=15))
+        if current and self.agent_runs_for_player(current["player_id"]):
+            raise GameError(
+                "This attempt belongs to an agent evaluation. Delete its player "
+                "to remove the evaluation and its attempts together."
+            )
 
         @firestore.transactional
         def delete(transaction):
@@ -424,6 +440,7 @@ class FirestoreRepository(GitCatalog):
             for session_ref in refs[offset : offset + 400]:
                 batch.delete(session_ref)
             batch.commit(timeout=60)
+        self.remove_agent_records_for_player(player_id)
         return {"deleted_players": 1, "deleted_sessions": len(refs)}
 
     def migrate_git_catalog(self):

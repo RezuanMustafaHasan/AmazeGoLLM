@@ -20,3 +20,5 @@ class Settings(BaseSettings):
     admin_username: str = "admin"
     admin_password_hash: SecretStr | None = None
     admin_session_secret: SecretStr | None = None
+    ufl_api_key: SecretStr | None = None
+    ufl_base_url: str | None = None

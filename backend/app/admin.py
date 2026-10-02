@@ -12,6 +12,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.app.agents import agent_router
+from backend.app.api_health import api_health_router
 from backend.app.config import Settings
 from backend.app.engine import GameError
 
@@ -120,6 +122,8 @@ def admin_router(settings: Settings):
     router = APIRouter(prefix="/api/admin", tags=["admin"])
     auth = AdminAuth(settings)
     admin_dependency = Depends(auth.require)
+    router.include_router(agent_router(admin_dependency))
+    router.include_router(api_health_router(settings, admin_dependency))
 
     @router.post("/login")
     def login(body: Login, request: Request, response: Response):

@@ -213,7 +213,114 @@ Player and attempt details are stored as JSON payloads, with separate queryable
 identity fields. Board matrices and arrow paths exist only in the Git catalog and
 in-memory/API observations; they are not persisted to Firestore.
 
-## Human and future LLM API
+## LLM evaluations in the admin panel
+
+Open `/admin` and choose **LLM agents**. Create a named evaluation with a model preset,
+editable model ID, contiguous level range, and 1–100 lives per level. Each run has
+its own player identity; each level has a separate attempt and a fresh life budget.
+Wins and losses both advance to the next selected level. Runs and transcripts
+persist in Firestore; memory mode remains temporary.
+
+All model families use the same UFL OpenAI-compatible Chat Completions API, matching
+the supplied `run_navapi.py` format. Set these **server environment variables** in
+Vercel (or the local ignored `.env`) and redeploy/restart:
+
+```dotenv
+UFL_API_KEY=your-ufl-key
+UFL_BASE_URL=https://api.ai.it.ufl.edu
+```
+
+The base URL is used as supplied, including any configured path; the app does not
+append `/v1`. No separate OpenAI, Anthropic, or Gemini key is needed. The seven
+presets are `gpt-6-luna`, `gpt-6.1-sol`, `gpt-6-astra`, `opus-5`, `opus-5.5`,
+`fable-5.1`, and `gemini-3.8-flash`. These are requested gateway aliases, not a
+claim that the key has access to them. Gemini's preset ID is inferred from its
+display name; use the exact ID reported by UFL if it differs. Model IDs remain
+editable, and existing runs also route through UFL.
+
+The server uses this request structure, with the current PNG in the user message:
+
+```python
+from openai import OpenAI
+import os
+
+with OpenAI(
+    api_key=os.environ["UFL_API_KEY"],
+    base_url=os.environ["UFL_BASE_URL"],
+    timeout=90,
+    max_retries=0,
+) as client:
+    response = client.chat.completions.create(
+        model="gpt-6-luna",
+        messages=[{"role": "user", "content": "This is a test request. Write a sentence."}],
+    )
+    print(response.choices[0].message.content)
+```
+
+An optional per-run UFL API key overrides `UFL_API_KEY`.
+Run credentials are encrypted with a key derived from `ADMIN_SESSION_SECRET` and
+are never returned in admin responses or kept in browser storage. Rotating that
+secret requires recreating runs that use the old encrypted credentials.
+
+Open **Admin → API health** to inspect configuration and check one or all models.
+Loading the page does not call the gateway. **Discover model IDs** reads UFL's
+`/models` endpoint; if listing is unavailable, you can still enter a model ID.
+**Text response** sends a short prompt and validates non-empty completion content
+and the expected reply. **Image response** attaches a blue PNG and checks the
+reported color. Each result shows response text, returned model, finish reason,
+latency, token usage when supplied, and safe failure diagnostics. A warning means
+text was returned but the expected reply did not finish correctly. Image checks
+confirm a basic image request; they do not measure puzzle-solving quality.
+
+Checks make real calls and can consume API credits. Check-all runs one bounded
+request per model, updates results as they finish, and stops scheduling checks
+when you leave the page. Text and image results are kept separately for the current
+page visit. Upstream errors never expose raw bodies, headers, or keys. These
+endpoints use the existing admin cookie and CSRF protection:
+
+| Method | Endpoint                      | Purpose                              |
+| ------ | ----------------------------- | ------------------------------------ |
+| GET    | `/api/admin/api-health`       | Configuration and requested presets. |
+| POST   | `/api/admin/api-health/models` | Discover gateway model IDs.          |
+| POST   | `/api/admin/api-health/check`  | Check one model (`model`, `mode`, `timeout_seconds`). |
+
+**Single step** makes one model request. **Play** repeats turns while the panel
+stays open. **Pause** lets an in-flight request finish; **Stop** discards an
+in-flight decision if it has not already been applied. Autoplay stops when leaving
+the panel and requires pressing Play again after reopening. There is no background
+worker or unattended billing after the panel closes. A submitted request can still
+finish after closing the browser. The dashboard displays the current labelled
+PNG, lives, moves, mistakes, level outcomes, and paginated turn transcripts with
+the exact request, raw response, brief model explanation, token usage, latency,
+and before/after images. Delete an evaluation's player from Players to remove
+its attempts, encrypted credential, and transcripts together.
+
+Every call supplies the complete rules and current PNG. The default observation
+contains the image, remaining IDs, and counters. An optional setting adds the
+matrix and tail-to-head paths. Neither mode sends solver-derived legal moves or
+hints. The action contract is one JSON object:
+
+```json
+{"arrow_id": 12, "explanation": "Its forward lane appears clear."}
+```
+
+The engine computes the next state. A blocked or invalid model action costs one
+life without changing the board. The next request names the last tapped arrow,
+its blocker where applicable, the lost life, and lives remaining. Transport,
+authentication, quota, and image-support errors pause the run without scoring a
+mistake. Output-token, request-timeout, and per-level turn limits are configurable.
+Only image-capable model IDs work; rejected image inputs are never silently
+replaced by text-only calls.
+
+Each step uses a UUID, a durable lease, and the game's retry receipts. Concurrent
+steps are rejected. Completed requests can be retried without another model call
+or game action. A saved response can recover after an interrupted game commit;
+if a process dies before saving its provider response, recovery after the
+ten-minute lease expires may require another provider call.
+
+Gateway request format: [LiteLLM OpenAI-compatible client setup](https://docs.litellm.ai/docs/proxy/user_keys).
+
+## Human and agent API
 
 Both use the same server-side engine. The human UI predicts each move immediately,
 so animation, hints, and life-loss feedback do not wait for Firebase. Rapid taps
