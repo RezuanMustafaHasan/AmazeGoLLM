@@ -104,6 +104,10 @@ def completion_usage(response):
         "output_tokens": getattr(usage, "completion_tokens", None),
         "total_tokens": getattr(usage, "total_tokens", None),
     }
+    details = getattr(usage, "completion_tokens_details", None)
+    reasoning_tokens = getattr(details, "reasoning_tokens", None)
+    if reasoning_tokens is not None:
+        values["reasoning_tokens"] = reasoning_tokens
     return {
         name: value if type(value) is int and value >= 0 else None for name, value in values.items()
     }

@@ -288,9 +288,11 @@ endpoints use the existing admin cookie and CSRF protection:
 | POST   | `/api/admin/api-health/check`  | Check one model (`model`, `mode`, `timeout_seconds`). |
 
 **Single step** makes one model request. **Play** repeats turns while the panel
-stays open. **Pause** lets an in-flight request finish; **Stop** discards an
+stays open. **Pause** saves progress and lets an in-flight request finish;
+**Resume session** continues the saved attempt later, including after reopening
+the panel or stopping. **Stop** discards an
 in-flight decision if it has not already been applied. Autoplay stops when leaving
-the panel and requires pressing Play again after reopening. There is no background
+the panel and requires pressing Continue or Resume again after reopening. There is no background
 worker or unattended billing after the panel closes. A submitted request can still
 finish after closing the browser. The dashboard displays the current labelled
 PNG, lives, moves, mistakes, level outcomes, and paginated turn transcripts with
@@ -307,13 +309,29 @@ hints. The action contract is one JSON object:
 {"arrow_id": 12, "explanation": "Its forward lane appears clear."}
 ```
 
-The engine computes the next state. A blocked or invalid model action costs one
-life without changing the board. The next request names the last tapped arrow,
+The engine computes the next state. Only a blocked tap costs a life. Missing,
+empty, truncated, malformed, and unknown-arrow responses leave the board, lives,
+moves, and mistakes unchanged. They remain visible in the transcript as unscored
+response failures. The next request names the last tapped arrow,
 its blocker where applicable, the lost life, and lives remaining. Transport,
-authentication, quota, and image-support errors pause the run without scoring a
-mistake. Output-token, request-timeout, and per-level turn limits are configurable.
+timeouts, connection errors, HTTP 408/409/429 and server errors use bounded
+automatic recovery during autoplay, with exponential backoff and the provider's
+`Retry-After` delay when supplied. Three consecutive failures halt autoplay until
+the admin resumes. Authentication, access, bad request, and refusal errors require
+admin attention immediately. No provider failure scores a mistake. An exhausted
+output budget doubles for the next request, up to 16,384 tokens. Finish reasons,
+effective output budgets, and safe error categories/HTTP statuses are logged.
+Output-token, request-timeout, and per-level turn limits are configurable.
 Only image-capable model IDs work; rejected image inputs are never silently
 replaced by text-only calls.
+
+**Download performance history** is available after completion or whenever a
+session is paused, stopped, or awaiting admin recovery, after its in-flight turn
+finishes. The admin-only JSON download includes all transcript pages, config,
+level results, per-turn prompts and responses, token usage, latency, diagnostics,
+before/after snapshots, game action history, original boards and hashes, plus
+overall and per-level performance totals. Historical invalid-action life penalties
+are preserved and reported separately. Tokens on failed requests may be unknown.
 
 Each step uses a UUID, a durable lease, and the game's retry receipts. Concurrent
 steps are rejected. Completed requests can be retried without another model call

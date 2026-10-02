@@ -33,7 +33,8 @@ GAME RULES (apply on every turn):
    body do not block it. Holes do not end the ray. Bent bodies do not turn the ray.
 4. A clear tap removes the entire arrow. A blocked tap leaves the board unchanged
    and costs exactly one life. Never move, rotate, or change an arrow yourself.
-5. Unknown/removed IDs, malformed JSON, and missing actions cost exactly one life.
+5. Only a blocked tap costs a life. Unknown/removed IDs, malformed JSON, missing
+   answers, and API failures are retried without changing the board or lives.
    At zero lives the level attempt ends in a loss. Each new level resets lives.
 6. No hints or solver are available. Infer a safe tap from the attached image.
 7. Use feedback from the previous action. Choose from the remaining arrow IDs.
@@ -88,7 +89,7 @@ def feedback(session):
     )
 
 
-def build_prompt(session, state, mode):
+def build_prompt(session, state, mode, response_feedback=None):
     observation = {
         "level_number": state["level"]["number"],
         "rows": state["level"]["rows"],
@@ -101,7 +102,15 @@ def build_prompt(session, state, mode):
     if mode == "image_and_state":
         observation.update(matrix=state["matrix"], arrows=state["arrows"])
     return (
-        feedback(session) + "\nCurrent observation (zero-based row/column paths are "
+        feedback(session)
+        + (
+            f"\nPrevious request failed: {response_feedback} "
+            'Return exactly one JSON object, e.g. {"arrow_id": 12}. '
+            "Keep the explanation brief."
+            if response_feedback
+            else ""
+        )
+        + "\nCurrent observation (zero-based row/column paths are "
         "tail first, head last when supplied):\n"
         + json.dumps(observation)
         + "\nThe attached PNG is the current state. Choose exactly one arrow to tap."
@@ -120,11 +129,20 @@ def invoke_model(config, api_key, prompt, png, *, base_url):
             {"role": "user", "content": image_content(prompt, png)},
         ],
     )
-    # Only visible text is stored; provider reasoning blocks are not requested or exposed.
-    # A completed empty answer is a missing game action and retains its life penalty.
-    raw = completion_text(response, allow_empty=True)
+    # Keep completion metadata so an exhausted reasoning budget is distinguishable
+    # from a bad game decision. Never store provider reasoning or refusal text.
+    choices = getattr(response, "choices", None)
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    refused = bool(getattr(getattr(choice, "message", None), "refusal", None))
+    raw = "" if refused else completion_text(response, allow_empty=True)
+    raw = raw.replace(api_key, "[redacted]") if api_key else raw
+    reason = getattr(choice, "finish_reason", None)
     return {
         "raw_response": raw[:64000],
         "response_truncated": len(raw) > 64000,
         "usage": completion_usage(response),
+        "finish_reason": reason
+        if reason in {"stop", "length", "content_filter", "tool_calls", "function_call"}
+        else "unknown",
+        "refused": refused,
     }

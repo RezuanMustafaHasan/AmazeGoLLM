@@ -1,5 +1,6 @@
 import json
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from uuid import uuid4
@@ -7,6 +8,7 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from openai import APIStatusError, APITimeoutError
 from PIL import Image
 from pydantic import SecretStr
 
@@ -84,6 +86,13 @@ def step(client, headers, run, request_id=None):
         headers=headers,
         json={"request_id": request_id or str(uuid4())},
     )
+
+
+@pytest.fixture
+def retry_clock(monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr("backend.app.agents.time.time", lambda: clock[0])
+    return clock
 
 
 def test_admin_authorization_csrf_key_privacy_and_observation(evaluation):
@@ -168,21 +177,26 @@ def test_blocked_feedback_exact_image_retries_and_life_reset(evaluation):
         '[{"arrow_id": 2}]',
     ],
 )
-def test_invalid_actions_cost_lives_and_end_attempt(evaluation, raw):
+def test_invalid_actions_are_unscored_and_idempotent(evaluation, raw):
     client, runner, _ = evaluation
     csrf = login(client)
     run = client.post("/api/admin/agents", headers=csrf, json=config(lives=1, end_level=1)).json()
     runner.invoke = lambda *_: respond(raw)
-    result = step(client, csrf, run).json()
-    assert result["state"]["lives_remaining"] == 0
-    assert result["state"]["status"] == "lost" and result["status"] == "completed"
+    request_id = str(uuid4())
+    result = step(client, csrf, run, request_id).json()
+    assert result["state"]["lives_remaining"] == 1
+    assert result["state"]["status"] == "active" and result["status"] == "paused"
+    assert result["state"]["moves"] == result["state"]["mistakes"] == 0
+    assert result["state"]["revision"] == 0 and result["results"] == []
     assert result["state"]["removed_ids"] == []
     turn = client.get(f"/api/admin/agents/{run['id']}/turns").json()["items"][0]
     assert turn["raw_response"] == raw and turn["outcome"]["result"] == "invalid"
-    assert turn["after"]["lives_remaining"] == 0
+    assert turn["after"] == turn["before"] and turn["outcome"]["reward"] == 0
+    assert "No life was lost" in result["feedback"]
+    assert step(client, csrf, run, request_id).json()["turn_count"] == 1
 
 
-def test_provider_errors_pause_without_scoring_and_do_not_leak_keys(evaluation):
+def test_provider_errors_pause_without_scoring_and_do_not_leak_keys(evaluation, retry_clock):
     client, runner, _ = evaluation
     csrf = login(client)
     run = client.post("/api/admin/agents", headers=csrf, json=config()).json()
@@ -193,13 +207,159 @@ def test_provider_errors_pause_without_scoring_and_do_not_leak_keys(evaluation):
     runner.invoke = fail
     request_id = str(uuid4())
     result = step(client, csrf, run, request_id).json()
-    assert result["status"] == "error" and result["state"]["lives_remaining"] == 3
+    assert result["status"] == "paused" and result["state"]["lives_remaining"] == 3
     assert result["state"]["moves"] == 0 and "No life was lost" in result["error"]
     assert "private-test-key" not in json.dumps(result)
     runner.invoke = lambda *_: respond('{"arrow_id": 2}')
     # A retry of the failed request is read-only. A new request is intentional.
     assert step(client, csrf, run, request_id).json()["state"]["moves"] == 0
+    retry_clock[0] += 6
     assert step(client, csrf, run).json()["state"]["moves"] == 1
+
+
+@pytest.mark.parametrize(
+    "status,retryable",
+    [(400, False), (401, False), (403, False), (404, False), (408, True), (429, True), (503, True)],
+)
+def test_provider_status_diagnostics_backoff_and_retry_budget(
+    evaluation, retry_clock, status, retryable
+):
+    _, runner, store = evaluation
+    run = runner.create(CreateAgentRun(**config()))
+    runner.control(run["id"], "resume")
+    calls = []
+
+    def fail(*_):
+        calls.append(1)
+        response = httpx.Response(
+            status, request=httpx.Request("POST", "https://ufl.test"), headers={"Retry-After": "30"}
+        )
+        raise APIStatusError(
+            "private-test-key", response=response, body={"error": "private-test-key"}
+        )
+
+    runner.invoke = fail
+    first_id = str(uuid4())
+    result = runner.step(run["id"], first_id)
+    assert result["diagnostic"]["http_status"] == status
+    assert result["diagnostic"]["retryable"] is retryable
+    assert "private-test-key" not in json.dumps(result)
+    assert result["state"]["lives_remaining"] == 3 and result["state"]["moves"] == 0
+    assert result["status"] == ("running" if retryable else "error")
+    assert runner.step(run["id"], first_id)["turn_count"] == 1
+    if not retryable:
+        return
+    assert result["retry_at"] == retry_clock[0] + 30
+    assert runner.step(run["id"], str(uuid4()))["turn_count"] == 1
+    assert len(calls) == 1
+    for expected in [2, 3]:
+        retry_clock[0] += 31
+        result = runner.step(run["id"], str(uuid4()))
+        assert result["consecutive_failures"] == expected
+    assert result["status"] == "error" and len(calls) == 3
+    assert "three consecutive" in result["error"]
+    assert store.get_session(run["current_session_id"], run["player_id"])["history"] == []
+    runner.control(run["id"], "resume")
+    retry_clock[0] += 31
+    runner.invoke = lambda *_: respond('{"arrow_id": 2}')
+    recovered = runner.step(run["id"], str(uuid4()))
+    assert recovered["state"]["moves"] == 1 and recovered["state"]["lives_remaining"] == 3
+    assert recovered["consecutive_failures"] == 0 and recovered["retry_at"] is None
+
+
+def test_output_exhaustion_increases_budget_and_preserves_state(evaluation, retry_clock):
+    _, runner, _ = evaluation
+    run = runner.create(CreateAgentRun(**config()))
+    runner.control(run["id"], "resume")
+    budgets = []
+
+    def response(config, *_):
+        budgets.append(config["max_output_tokens"])
+        return {
+            **respond(""),
+            "finish_reason": "length",
+            "usage": {"output_tokens": config["max_output_tokens"]},
+        }
+
+    runner.invoke = response
+    for expected in [8192, 16384, 16384]:
+        result = runner.step(run["id"], str(uuid4()))
+        assert result["request_max_output_tokens"] == expected
+        assert result["state"]["revision"] == result["state"]["mistakes"] == 0
+        assert result["state"]["lives_remaining"] == 3
+        retry_clock[0] += 30
+    assert budgets == [4096, 8192, 16384] and result["status"] == "error"
+
+
+def test_timeout_then_pause_and_resume_after_runner_restart(evaluation, retry_clock):
+    from backend.app.agents import AgentRunner
+
+    _, runner, store = evaluation
+    run = runner.create(CreateAgentRun(**config()))
+    runner.control(run["id"], "resume")
+
+    def timeout(*_):
+        runner.control(run["id"], "pause")
+        raise APITimeoutError(request=httpx.Request("POST", "https://ufl.test"))
+
+    runner.invoke = timeout
+    result = runner.step(run["id"], str(uuid4()))
+    assert result["status"] == "paused" and result["diagnostic"]["code"] == "timeout"
+    later = AgentRunner(store, runner.settings)
+    later.control(run["id"], "resume")
+    later.invoke = lambda *_: respond('{"arrow_id": 2}')
+    retry_clock[0] += 6
+    resumed = later.step(run["id"], str(uuid4()))
+    assert resumed["state"]["session_id"] == run["current_session_id"]
+    assert resumed["state"]["lives_remaining"] == 3 and resumed["state"]["moves"] == 1
+
+
+def test_stopped_session_can_resume_existing_board(evaluation):
+    _, runner, _ = evaluation
+    run = runner.create(CreateAgentRun(**config(end_level=1)))
+    runner.invoke = lambda *_: respond('{"arrow_id": 2}')
+    runner.step(run["id"], str(uuid4()))
+    runner.control(run["id"], "stop")
+    resumed = runner.control(run["id"], "resume")
+    assert resumed["state"]["removed_ids"] == [2]
+    assert resumed["state"]["session_id"] == run["current_session_id"]
+    runner.invoke = lambda *_: respond('{"arrow_id": 1}')
+    completed = runner.step(run["id"], str(uuid4()))
+    assert completed["status"] == "completed"
+    with pytest.raises(GameError, match="completed"):
+        runner.control(run["id"], "resume")
+
+
+def test_detailed_download_includes_every_page_and_excludes_credentials(evaluation, retry_clock):
+    client, runner, store = evaluation
+    csrf = login(client)
+    run = runner.create(CreateAgentRun(**config()))
+    runner.invoke = lambda *_: respond("invalid JSON")
+    for _ in range(105):
+        runner.step(run["id"], str(uuid4()))
+        retry_clock[0] += 30
+    runner.invoke = lambda *_: respond('{"arrow_id": 2}')
+    runner.step(run["id"], str(uuid4()))
+    runner.control(run["id"], "stop")
+    response = client.get(f"/api/admin/agents/{run['id']}/history/download")
+    assert response.status_code == 200
+    assert "attachment;" in response.headers["content-disposition"]
+    assert response.headers["cache-control"] == "no-store"
+    report = response.json()
+    assert [t["number"] for t in report["turns"]] == list(range(106, 0, -1))
+    assert report["summary"]["invalid_responses"] == 105
+    assert report["summary"]["cleared"] == 1
+    assert report["summary"]["tokens"]["total_tokens"] == 106 * 110
+    assert report["per_level"]["level-001"]["requests"] == 106
+    assert report["sessions"][0]["action_history"][0]["result"] == "cleared"
+    assert report["levels"][0]["board"]["matrix"]
+    encrypted = store.get_agent_run(run["id"])["credential"]
+    assert encrypted not in response.text and "private-test-key" not in response.text
+    assert "credential" not in report["run"] and "pending" not in report["run"]
+    runner.control(run["id"], "resume")
+    assert client.get(f"/api/admin/agents/{run['id']}/history/download").status_code == 409
+    client.post("/api/admin/logout", headers=csrf)
+    assert client.get(f"/api/admin/agents/{run['id']}/history/download").status_code == 401
 
 
 def test_concurrent_steps_and_pause_stop_controls(evaluation):

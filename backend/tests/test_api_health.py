@@ -338,7 +338,7 @@ def test_agent_step_uses_the_same_gateway_with_server_credentials(health_app):
 
 
 @pytest.mark.parametrize("content", ["", None, "   "])
-def test_empty_completed_agent_response_preserves_missing_action_penalty(health_app, content):
+def test_empty_completed_agent_response_is_unscored(health_app, content):
     client, _, _, reply, _ = health_app
     csrf = login(client)
     reply["body"] = completion(content)
@@ -355,5 +355,48 @@ def test_empty_completed_agent_response_preserves_missing_action_penalty(health_
     result = client.post(
         f"/api/admin/agents/{run['id']}/step", headers=csrf, json={"request_id": str(uuid4())}
     ).json()
-    assert result["state"]["lives_remaining"] == 2 and result["state"]["mistakes"] == 1
+    assert result["state"]["lives_remaining"] == 3 and result["state"]["mistakes"] == 0
+    assert result["state"]["moves"] == 0 and result["diagnostic"]["code"] == "empty_response"
     assert result["state"]["removed_ids"] == []
+
+
+@pytest.mark.parametrize("failure", ["length", "missing_choices", "refusal", "content_filter"])
+def test_incomplete_gateway_completions_never_apply_an_action(health_app, failure):
+    client, _, _, reply, _ = health_app
+    csrf = login(client)
+    body = completion('{"arrow_id": 1}')
+    if failure == "missing_choices":
+        body["choices"] = []
+    elif failure == "refusal":
+        body["choices"][0]["message"]["refusal"] = "private-ufl-test-key"
+    else:
+        body["choices"][0]["finish_reason"] = failure
+    reply["body"] = body
+    run = client.post(
+        "/api/admin/agents",
+        headers=csrf,
+        json={
+            "name": "Gateway failure test",
+            "model": "claude-opus-5.5",
+            "start_level": 1,
+            "end_level": 1,
+        },
+    ).json()
+    result = client.post(
+        f"/api/admin/agents/{run['id']}/step",
+        headers=csrf,
+        json={"request_id": str(uuid4())},
+    ).json()
+    assert result["state"]["revision"] == result["state"]["moves"] == 0
+    assert result["state"]["lives_remaining"] == 3 and result["results"] == []
+    assert result["state"]["status"] == "active"
+    turn = client.get(f"/api/admin/agents/{run['id']}/turns").json()["items"][0]
+    assert "private-ufl-test-key" not in json.dumps(turn)
+    assert turn["after"] == turn["before"]
+    expected_code = {
+        "length": "output_limit",
+        "missing_choices": "invalid_response",
+        "refusal": "refusal",
+        "content_filter": "refusal",
+    }[failure]
+    assert turn["diagnostic"]["code"] == expected_code

@@ -9,16 +9,24 @@ from uuid import UUID, uuid4
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import APIRouter, Request
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictInt, model_validator
 
+from backend.app.agent_export import performance_report
 from backend.app.agent_image import render_board
 from backend.app.agent_llm import PROVIDERS, RULES, build_prompt, invoke_model, parse_decision
+from backend.app.agent_recovery import (
+    MAX_CONSECUTIVE_FAILURES,
+    MAX_OUTPUT_TOKENS,
+    provider_diagnostic,
+    response_diagnostic,
+    retry_delay,
+    retry_message,
+)
 from backend.app.agent_store import public_run
 from backend.app.engine import (
     GameError,
     apply_action,
-    apply_agent_error,
     new_session,
     now_iso,
     observation,
@@ -127,6 +135,11 @@ class AgentRunner:
             "turn_count": 0,
             "results": [],
             "error": None,
+            "diagnostic": None,
+            "consecutive_failures": 0,
+            "retry_at": None,
+            "response_feedback": None,
+            "request_max_output_tokens": body.max_output_tokens,
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
@@ -141,7 +154,9 @@ class AgentRunner:
         state.pop("legal_arrow_ids")
         result = public_run(run)
         result["state"] = state
-        result["feedback"] = build_prompt(session, state, run["config"]["observation_mode"])
+        result["feedback"] = build_prompt(
+            session, state, run["config"]["observation_mode"], run.get("response_feedback")
+        )
         result["system_prompt"] = RULES
         pending = run.get("pending")
         result["lease_expires_at"] = pending["expires_at"] if pending else None
@@ -149,11 +164,12 @@ class AgentRunner:
 
     def control(self, run_id, action):
         def update(run):
-            if run["status"] in {"completed", "stopped"}:
-                raise GameError("This agent session has ended. Create another session.")
+            if run["status"] == "completed":
+                raise GameError("This agent session has completed. Create another session.")
             if action == "resume":
                 run["status"] = "running"
                 run["error"] = None
+                run["consecutive_failures"] = 0
             else:
                 run["status"] = "paused" if action == "pause" else "stopped"
             run["updated_at"] = now_iso()
@@ -168,7 +184,10 @@ class AgentRunner:
 
     def step(self, run_id, request_id):
         previous = self.store.get_agent_turn(run_id, request_id)
-        if previous and previous["status"] in {"finished", "error", "cancelled"}:
+        if previous and previous["status"] in {"finished", "error", "invalid", "cancelled"}:
+            return self.detail(run_id)
+        current = self.store.get_agent_run(run_id)
+        if (current.get("retry_at") or 0) > time.time() and not current.get("pending"):
             return self.detail(run_id)
         lease = str(uuid4())
 
@@ -176,6 +195,8 @@ class AgentRunner:
             if run["status"] in {"completed", "stopped"}:
                 raise GameError("This agent session has ended.")
             pending = run.get("pending")
+            if not pending and (run.get("retry_at") or 0) > time.time():
+                raise GameError("Waiting before retrying the model request.", 409)
             if pending and pending["expires_at"] > time.time():
                 raise GameError("An LLM turn is already in progress. Wait for its result.")
             if not pending:
@@ -186,7 +207,9 @@ class AgentRunner:
                 }
             # A crashed step is recovered using its original UUID and saved response.
             pending.update(lease=lease, expires_at=time.time() + 600)
-            run.update(pending=pending, in_flight=True, updated_at=now_iso(), error=None)
+            run.update(
+                pending=pending, in_flight=True, updated_at=now_iso(), error=None, retry_at=None
+            )
             if run["status"] == "error":
                 run["status"] = "paused"
             return run, None
@@ -239,7 +262,12 @@ class AgentRunner:
                     "session_id": session["id"],
                     "level_id": session["level_id"],
                     "system_prompt": RULES,
-                    "prompt": build_prompt(session, state, run["config"]["observation_mode"]),
+                    "prompt": build_prompt(
+                        session,
+                        state,
+                        run["config"]["observation_mode"],
+                        run.get("response_feedback"),
+                    ),
                     "before": self.snapshot(state),
                     "created_at": now_iso(),
                     "raw_response": None,
@@ -248,9 +276,14 @@ class AgentRunner:
                     "error": None,
                     "usage": {},
                     "latency_ms": None,
+                    "diagnostic": None,
+                    "max_output_tokens": run.get(
+                        "request_max_output_tokens", run["config"]["max_output_tokens"]
+                    ),
                 }
                 self._save(run_id, lease, turn)
             if turn["raw_response"] is None:
+                turn.setdefault("max_output_tokens", run["config"]["max_output_tokens"])
                 try:
                     key = self.cipher().decrypt(run["credential"].encode()).decode()
                 except InvalidToken:
@@ -261,15 +294,17 @@ class AgentRunner:
                     ) from None
                 started = time.monotonic()
                 try:
-                    response = self.invoke(run["config"], key, turn["prompt"], render_board(state))
-                except Exception as error:
-                    # Provider exception bodies can contain credentials. Store a safe category.
-                    category = type(error).__name__
-                    turn["error"] = (
-                        f"Provider call failed ({category}). Check the API key, "
-                        "model image support, quota, and timeout. No life was lost."
+                    response = self.invoke(
+                        {**run["config"], "max_output_tokens": turn["max_output_tokens"]},
+                        key,
+                        turn["prompt"],
+                        render_board(state),
                     )
+                except Exception as error:
+                    turn["diagnostic"] = provider_diagnostic(error)
+                    turn["error"] = retry_message(turn["diagnostic"])
                     turn["status"] = "error"
+                    turn["after"] = self.snapshot(state)
                     turn["latency_ms"] = round((time.monotonic() - started) * 1000)
                     return self._finish(run_id, lease, turn, None)
                 turn.update(
@@ -290,14 +325,27 @@ class AgentRunner:
             except ValueError as error:
                 invalid = str(error)
 
+            diagnostic = response_diagnostic(
+                turn, turn.get("max_output_tokens", run["config"]["max_output_tokens"]), invalid
+            )
+            if diagnostic:
+                turn.update(
+                    status="invalid",
+                    decision=None,
+                    diagnostic=diagnostic,
+                    error=retry_message(diagnostic),
+                    after=self.snapshot(state),
+                    outcome={
+                        "result": "invalid",
+                        "arrow_id": None,
+                        "blocked_by": None,
+                        "reward": 0,
+                        "message": diagnostic["message"],
+                    },
+                )
+                return self._finish(run_id, lease, turn, None)
+
             def apply(current):
-                if invalid:
-                    return apply_agent_error(
-                        current,
-                        action_id=turn_id,
-                        expected_revision=turn["before"]["revision"],
-                        message=invalid,
-                    )
                 return apply_action(
                     current,
                     action_id=turn_id,
@@ -355,9 +403,33 @@ class AgentRunner:
                 pending=None, in_flight=False, turn_count=turn["number"], updated_at=now_iso()
             )
             if turn["error"]:
-                if run["status"] != "stopped":
+                diagnostic = turn["diagnostic"]
+                failures = run.get("consecutive_failures", 0) + 1
+                run.update(
+                    consecutive_failures=failures,
+                    diagnostic=diagnostic,
+                    response_feedback=turn["error"],
+                )
+                if diagnostic["code"] == "output_limit":
+                    budget = turn.get("max_output_tokens", run["config"]["max_output_tokens"])
+                    run["request_max_output_tokens"] = min(budget * 2, MAX_OUTPUT_TOKENS)
+                if diagnostic["retryable"]:
+                    run["retry_at"] = time.time() + retry_delay(failures, diagnostic)
+                if run["status"] not in {"paused", "stopped"} and (
+                    not diagnostic["retryable"] or failures >= MAX_CONSECUTIVE_FAILURES
+                ):
                     run["status"] = "error"
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    turn["error"] += " Automatic retries stopped after three consecutive failures."
                 run["error"] = turn["error"]
+            elif session:
+                run.update(
+                    consecutive_failures=0,
+                    retry_at=None,
+                    diagnostic=None,
+                    response_feedback=None,
+                    error=None,
+                )
             if session and session["status"] != "active":
                 result = {
                     k: session[k]
@@ -427,6 +499,23 @@ def agent_router(admin_dependency):
             raise GameError("Page size must be between 1 and 100.", 422)
         runner(request).store.get_agent_run(str(run_id))
         return runner(request).store.list_agent_turns(str(run_id), limit, before)
+
+    @router.get("/{run_id}/history/download")
+    def download(run_id: UUID, request: Request):
+        store = runner(request).store
+        run = store.get_agent_run(str(run_id))
+        if run["status"] == "running" or run.get("in_flight") or run.get("pending"):
+            raise GameError(
+                "Pause the session and let its current turn finish before downloading.", 409
+            )
+        return StreamingResponse(
+            performance_report(store, run),
+            media_type="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="agent-{run_id}-performance.json"',
+                "Cache-Control": "no-store",
+            },
+        )
 
     @router.get("/{run_id}/image")
     def image(

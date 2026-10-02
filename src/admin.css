@@ -1210,6 +1210,12 @@
   flex-wrap: wrap;
   gap: 8px;
 }
+.agent-controls a.admin-secondary {
+  text-decoration: none;
+}
+.agent-retry-note {
+  margin: 8px 0 0;
+}
 .agent-speed {
   display: flex;
   align-items: center;

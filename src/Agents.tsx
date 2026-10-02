@@ -4,6 +4,7 @@ import {
   Bot,
   ChevronLeft,
   ChevronRight,
+  Download,
   Heart,
   LoaderCircle,
   Pause,
@@ -17,6 +18,7 @@ import {
   ZoomOut,
 } from 'lucide-react'
 import type { GameState, LevelSummary } from './types'
+import { canResume, nextTurnDelay } from './agentPlayback'
 
 type Request = <T>(path: string, options?: RequestInit) => Promise<T>
 interface Provider {
@@ -58,6 +60,10 @@ interface Run {
   turn_count: number
   results: Result[]
   error: string | null
+  diagnostic?: { code: string; http_status?: number; retryable: boolean }
+  retry_at?: number | null
+  consecutive_failures?: number
+  request_max_output_tokens?: number
   created_at: string
 }
 interface Detail extends Run {
@@ -95,6 +101,9 @@ interface Turn {
   error: string | null
   usage: { input_tokens?: number; output_tokens?: number; total_tokens?: number }
   latency_ms: number | null
+  finish_reason?: string
+  max_output_tokens?: number
+  diagnostic?: { code: string; http_status?: number; retryable: boolean }
   created_at: string
 }
 interface Page<T> {
@@ -134,11 +143,14 @@ export default function Agents({ request }: { request: Request }) {
   const [apiKey, setApiKey] = useState('')
   const [showSetup, setShowSetup] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [controlling, setControlling] = useState(false)
   const [auto, setAuto] = useState(false)
   const [delay, setDelay] = useState(1000)
   const [error, setError] = useState<string | null>(null)
   const [imagePhase, setImagePhase] = useState<'before' | 'after'>('before')
   const [boardZoom, setBoardZoom] = useState(1)
+  const [clientRetryAt, setClientRetryAt] = useState(0)
+  const clientFailures = useRef(0)
   const working = useRef(false)
   const mounted = useRef(true)
   const selectedId = useRef<string | null>(null)
@@ -167,6 +179,10 @@ export default function Agents({ request }: { request: Request }) {
       ])
       if (!mounted.current || selectedId.current !== id) return
       setRun(detail)
+      setRuns((previous) => ({
+        ...previous,
+        items: previous.items.map((item) => (item.id === id ? detail : item)),
+      }))
       setTurns(history)
       return detail
     },
@@ -194,6 +210,8 @@ export default function Agents({ request }: { request: Request }) {
     setAuto(false)
     selectedId.current = id
     retryId.current = null
+    clientFailures.current = 0
+    setClientRetryAt(0)
     setBusy(true)
     setSelectedTurn(null)
     setError(null)
@@ -220,6 +238,8 @@ export default function Agents({ request }: { request: Request }) {
       setApiKey('')
       selectedId.current = detail.id
       retryId.current = null
+      clientFailures.current = 0
+      setClientRetryAt(0)
       setRun(detail)
       setTurns({ items: [], next_before: null })
       setSelectedTurn(null)
@@ -248,15 +268,22 @@ export default function Agents({ request }: { request: Request }) {
         signal: AbortSignal.timeout((run.config.timeout_seconds + 60) * 1000),
       })
       retryId.current = null
+      clientFailures.current = 0
+      setClientRetryAt(0)
       if (!mounted.current || selectedId.current !== id) return
       setRun(detail)
-      if (detail.status !== 'running' || detail.error) setAuto(false)
+      if (detail.status !== 'running') setAuto(false)
       await load(id)
     } catch (err) {
-      if (mounted.current) {
-        setAuto(false)
-        setError(errorMessage(err))
-        await load(id).catch(() => {})
+      if (mounted.current && selectedId.current === id) {
+        const latest = await load(id).catch(() => undefined)
+        clientFailures.current += 1
+        const retry = clientFailures.current < 3 && (!latest || latest.status === 'running')
+        if (!retry) setAuto(false)
+        setClientRetryAt(Date.now() + 5000 * 2 ** (clientFailures.current - 1))
+        setError(
+          errorMessage(err) + (retry ? ' Retrying the same request safely.' : ' Resume to retry.'),
+        )
       }
     } finally {
       working.current = false
@@ -266,12 +293,18 @@ export default function Agents({ request }: { request: Request }) {
 
   useEffect(() => {
     if (!auto || busy || !run || run.status !== 'running') return
-    const timer = window.setTimeout(() => void step(), delay)
+    const wait = Math.max(
+      nextTurnDelay(delay, run.retry_at, Date.now()),
+      clientRetryAt - Date.now(),
+    )
+    const timer = window.setTimeout(() => void step(), wait)
     return () => window.clearTimeout(timer)
-  }, [auto, busy, run, step, delay])
+  }, [auto, busy, run, step, delay, clientRetryAt])
 
   async function control(action: 'resume' | 'pause' | 'stop') {
     if (!run) return
+    const id = run.id
+    setControlling(true)
     if (action !== 'resume') setAuto(false)
     setError(null)
     try {
@@ -279,12 +312,22 @@ export default function Agents({ request }: { request: Request }) {
         method: 'POST',
         body: JSON.stringify({ action }),
       })
-      if (!mounted.current) return
+      if (!mounted.current || selectedId.current !== id) return
       setRun(detail)
-      if (action === 'resume') setAuto(true)
+      setRuns((previous) => ({
+        ...previous,
+        items: previous.items.map((item) => (item.id === id ? detail : item)),
+      }))
+      if (action === 'resume') {
+        clientFailures.current = 0
+        setClientRetryAt(0)
+        setAuto(true)
+      }
     } catch (err) {
       setError(errorMessage(err))
       setAuto(false)
+    } finally {
+      setControlling(false)
     }
   }
 
@@ -501,7 +544,7 @@ export default function Agents({ request }: { request: Request }) {
           </details>
           <div className="agent-setup-footer">
             <p>
-              <code>{'{"arrow_id": 12}'}</code> · A blocked or invalid action costs one life.
+              <code>{'{"arrow_id": 12}'}</code> · Only a blocked tap costs one life.
             </p>
             <button
               className="admin-primary"
@@ -596,6 +639,8 @@ export default function Agents({ request }: { request: Request }) {
                     busy ||
                     auto ||
                     ended ||
+                    controlling ||
+                    (run.retry_at ?? 0) * 1000 > Date.now() ||
                     (run.in_flight && (run.lease_expires_at ?? 0) * 1000 > Date.now())
                   }
                 >
@@ -606,26 +651,39 @@ export default function Agents({ request }: { request: Request }) {
                   )}
                   {busy ? 'Waiting for model…' : retryId.current ? 'Retry turn' : 'Single step'}
                 </button>
-                {auto ? (
-                  <button className="admin-secondary" onClick={() => void control('pause')}>
+                {(auto || run.status === 'running') && (
+                  <button
+                    className="admin-secondary"
+                    disabled={controlling}
+                    onClick={() => void control('pause')}
+                  >
                     <Pause size={16} /> Pause
                   </button>
-                ) : (
+                )}
+                {!auto && (
                   <button
                     className="admin-primary"
                     onClick={() => void control('resume')}
-                    disabled={busy || ended || run.in_flight}
+                    disabled={busy || controlling || !canResume(run.status, run.in_flight)}
                   >
-                    <Play size={16} /> Play
+                    <Play size={16} /> {run.status === 'running' ? 'Continue' : 'Resume session'}
                   </button>
                 )}
                 <button
                   className="admin-secondary"
                   onClick={() => void control('stop')}
-                  disabled={ended}
+                  disabled={ended || controlling}
                 >
                   <Square size={15} /> Stop
                 </button>
+                {run.status !== 'running' && !run.in_flight && !run.lease_expires_at && (
+                  <a
+                    className="admin-secondary"
+                    href={`/api/admin/agents/${run.id}/history/download`}
+                  >
+                    <Download size={16} /> Download performance history
+                  </a>
+                )}
                 <label className="agent-speed">
                   Between turns
                   <select value={delay} onChange={(e) => setDelay(Number(e.target.value))}>
@@ -637,11 +695,23 @@ export default function Agents({ request }: { request: Request }) {
                 </label>
               </div>
               <p className="agent-play-note">
-                Autoplay runs while this panel stays open. Pause lets the current request finish.
+                Pause saves progress after the current request finishes. Resume continues this
+                session later, including after reopening the panel. Autoplay runs while this panel
+                stays open. Temporary failures retry up to three consecutive failed requests.
               </p>
               {run.error && (
                 <div className="admin-error" role="alert">
                   {run.error}
+                  {run.diagnostic && (
+                    <p className="agent-retry-note">
+                      {run.diagnostic.code}
+                      {run.diagnostic.http_status && ` · HTTP ${run.diagnostic.http_status}`}
+                      {run.status === 'running' &&
+                        run.retry_at &&
+                        ` · Next retry after ${new Date(run.retry_at * 1000).toLocaleTimeString()}`}
+                      {` · Consecutive failures: ${run.consecutive_failures ?? 0}/3`}
+                    </p>
+                  )}
                 </div>
               )}
               <div className="agent-state-bar" aria-live="polite">
@@ -844,7 +914,12 @@ export default function Agents({ request }: { request: Request }) {
                       {activeTurn.outcome.result === 'blocked'
                         ? `Arrow ${activeTurn.outcome.arrow_id} was blocked by arrow ${activeTurn.outcome.blocked_by}. One life lost.`
                         : activeTurn.outcome.result === 'invalid'
-                          ? `Invalid action: ${activeTurn.outcome.message} One life lost.`
+                          ? `Invalid response: ${activeTurn.outcome.message} ${
+                              activeTurn.after &&
+                              activeTurn.after.lives_remaining < activeTurn.before.lives_remaining
+                                ? 'One life was charged by the previous scoring policy.'
+                                : 'No life lost.'
+                            }`
                           : `Arrow ${activeTurn.outcome.arrow_id} cleared successfully.`}
                     </p>
                   )}
@@ -889,6 +964,9 @@ export default function Agents({ request }: { request: Request }) {
                     {' · '}Session {activeTurn.session_id.slice(0, 8)} · Revision{' '}
                     {activeTurn.before.revision}
                     {activeTurn.after && ` → ${activeTurn.after.revision}`}
+                    {activeTurn.finish_reason && ` · Finish: ${activeTurn.finish_reason}`}
+                    {activeTurn.max_output_tokens &&
+                      ` · Output budget: ${activeTurn.max_output_tokens}`}
                   </p>
                 </div>
               )}
