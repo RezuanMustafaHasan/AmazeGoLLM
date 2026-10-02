@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "id": "my-first-level",
+  "number": 49,
+  "name": "A fresh start",
+  "difficulty": "easy",
+  "shape": "rectangle",
+  "lives": 3,
+  "matrix": [
+    [0, 0, 0, 0, 0],
+    [1, 1, 0, 2, 0],
+    [0, 0, 0, 2, 0]
+  ],
+  "arrows": [
+    { "id": 1, "path": [[1, 0], [1, 1]] },
+    { "id": 2, "path": [[1, 3], [2, 3]] }
+  ]
+}

@@ -1,0 +1,118 @@
+{
+  "$defs": {
+    "Arrow": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "exclusiveMinimum": 0,
+          "title": "Id",
+          "type": "integer"
+        },
+        "path": {
+          "items": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "maxItems": 4096,
+          "minItems": 2,
+          "title": "Path",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "path"
+      ],
+      "title": "Arrow",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "id": {
+      "pattern": "^[a-zA-Z0-9_-]{1,80}$",
+      "title": "Id",
+      "type": "string"
+    },
+    "number": {
+      "minimum": 1,
+      "title": "Number",
+      "type": "integer"
+    },
+    "name": {
+      "maxLength": 80,
+      "minLength": 1,
+      "title": "Name",
+      "type": "string"
+    },
+    "difficulty": {
+      "enum": [
+        "easy",
+        "medium",
+        "hard",
+        "expert"
+      ],
+      "title": "Difficulty",
+      "type": "string"
+    },
+    "shape": {
+      "default": "rectangle",
+      "maxLength": 40,
+      "title": "Shape",
+      "type": "string"
+    },
+    "lives": {
+      "default": 3,
+      "maximum": 10,
+      "minimum": 1,
+      "title": "Lives",
+      "type": "integer"
+    },
+    "matrix": {
+      "items": {
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      },
+      "maxItems": 100,
+      "minItems": 2,
+      "title": "Matrix",
+      "type": "array"
+    },
+    "arrows": {
+      "items": {
+        "$ref": "#/$defs/Arrow"
+      },
+      "maxItems": 1000,
+      "minItems": 1,
+      "title": "Arrows",
+      "type": "array"
+    }
+  },
+  "required": [
+    "id",
+    "number",
+    "name",
+    "difficulty",
+    "matrix",
+    "arrows"
+  ],
+  "title": "Level",
+  "type": "object"
+}

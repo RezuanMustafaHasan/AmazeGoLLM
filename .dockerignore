@@ -1,0 +1,14 @@
+.git
+.env
+.env.*
+.venv
+node_modules
+dist
+.firebase
+.emulator-data
+**/__pycache__
+**/*.service-account.json
+**/*debug.log
+artifacts
+.pytest_cache
+.ruff_cache
