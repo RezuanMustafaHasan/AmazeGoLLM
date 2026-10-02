@@ -269,12 +269,14 @@ def test_provider_status_diagnostics_backoff_and_retry_budget(
 
 def test_output_exhaustion_increases_budget_and_preserves_state(evaluation, retry_clock):
     _, runner, _ = evaluation
-    run = runner.create(CreateAgentRun(**config()))
+    run = runner.create(CreateAgentRun(**config(thinking_effort="max")))
     runner.control(run["id"], "resume")
     budgets = []
+    efforts = []
 
     def response(config, *_):
         budgets.append(config["max_output_tokens"])
+        efforts.append(config["thinking_effort"])
         return {
             **respond(""),
             "finish_reason": "length",
@@ -289,6 +291,7 @@ def test_output_exhaustion_increases_budget_and_preserves_state(evaluation, retr
         assert result["state"]["lives_remaining"] == 3
         retry_clock[0] += 30
     assert budgets == [4096, 8192, 16384] and result["status"] == "error"
+    assert efforts == ["max", "max", "max"]
 
 
 def test_timeout_then_pause_and_resume_after_runner_restart(evaluation, retry_clock):

@@ -8,6 +8,7 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from pydantic import StringConstraints
 
 from backend.app.engine import GameError
+from backend.app.model_thinking import thinking_parameters
 
 ModelId = Annotated[
     str,
@@ -70,10 +71,24 @@ def image_content(prompt, png):
     ]
 
 
-def complete(*, base_url, api_key, model, messages, timeout_seconds, max_output_tokens=None):
+def complete(
+    *,
+    base_url,
+    api_key,
+    model,
+    messages,
+    timeout_seconds,
+    max_output_tokens=None,
+    thinking_effort=None,
+):
     options = {"model": model, "messages": messages}
     if max_output_tokens is not None:
         options["max_tokens"] = max_output_tokens
+    thinking = thinking_parameters(model, thinking_effort)
+    if "reasoning_effort" in thinking:
+        options.update(thinking)
+    elif thinking:
+        options["extra_body"] = thinking
     with OpenAI(
         api_key=api_key, base_url=base_url, timeout=timeout_seconds, max_retries=0
     ) as client:
@@ -141,7 +156,11 @@ def safe_error(error):
     if isinstance(error, APIStatusError):
         status = error.status_code
         code, message = {
-            400: ("bad_request", "UFL rejected the request. Check the model ID and input support."),
+            400: (
+                "bad_request",
+                "UFL rejected the request. Check the model ID, input support, "
+                "and selected thinking settings.",
+            ),
             401: ("authentication_error", "UFL rejected the API key. Check UFL_API_KEY."),
             403: (
                 "permission_denied",

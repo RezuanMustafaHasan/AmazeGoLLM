@@ -19,6 +19,13 @@ import {
 } from 'lucide-react'
 import type { GameState, LevelSummary } from './types'
 import { canResume, nextTurnDelay } from './agentPlayback'
+import ThinkingControl from './ThinkingControl'
+import {
+  effortLabel,
+  selectedThinking,
+  type ThinkingCatalog,
+  type ThinkingSelections,
+} from './modelThinking'
 
 type Request = <T>(path: string, options?: RequestInit) => Promise<T>
 interface Provider {
@@ -34,6 +41,7 @@ interface Config {
   name: string
   provider: string
   model: string
+  thinking_effort?: string | null
   start_level: number
   end_level: number
   lives: number
@@ -103,6 +111,8 @@ interface Turn {
   latency_ms: number | null
   finish_reason?: string
   max_output_tokens?: number
+  thinking_effort?: string | null
+  thinking_parameters?: Record<string, unknown>
   diagnostic?: { code: string; http_status?: number; retryable: boolean }
   created_at: string
 }
@@ -134,6 +144,8 @@ const timestamp = (value: string) => new Date(value).toLocaleString()
 
 export default function Agents({ request }: { request: Request }) {
   const [providers, setProviders] = useState<Provider[]>([])
+  const [thinkingCatalog, setThinkingCatalog] = useState<ThinkingCatalog>({})
+  const [thinkingSelections, setThinkingSelections] = useState<ThinkingSelections>({})
   const [levels, setLevels] = useState<LevelSummary[]>([])
   const [runs, setRuns] = useState<Page<Run>>({ items: [], next_cursor: null })
   const [run, setRun] = useState<Detail | null>(null)
@@ -158,7 +170,7 @@ export default function Agents({ request }: { request: Request }) {
 
   const refresh = useCallback(async () => {
     const [providerData, runData, levelData] = await Promise.all([
-      request<{ providers: Provider[] }>('/agents/providers'),
+      request<{ providers: Provider[]; thinking_models: ThinkingCatalog }>('/agents/providers'),
       request<Page<Run>>('/agents'),
       fetch('/api/v1/levels').then(async (response) => {
         if (!response.ok) throw new Error('Could not load the level catalog.')
@@ -167,6 +179,7 @@ export default function Agents({ request }: { request: Request }) {
     ])
     if (!mounted.current) return
     setProviders(providerData.providers)
+    setThinkingCatalog(providerData.thinking_models)
     setRuns(runData)
     setLevels(levelData.levels)
   }, [request])
@@ -233,7 +246,11 @@ export default function Agents({ request }: { request: Request }) {
     try {
       const detail = await request<Detail>('/agents', {
         method: 'POST',
-        body: JSON.stringify({ ...config, ...(apiKey ? { api_key: apiKey } : {}) }),
+        body: JSON.stringify({
+          ...config,
+          thinking_effort: selectedThinking(config.model, thinkingCatalog, thinkingSelections),
+          ...(apiKey ? { api_key: apiKey } : {}),
+        }),
       })
       setApiKey('')
       selectedId.current = detail.id
@@ -429,6 +446,14 @@ export default function Agents({ request }: { request: Request }) {
               />
               <small>Use the exact UFL model ID. Verify image support in API health.</small>
             </label>
+            <ThinkingControl
+              model={config.model}
+              catalog={thinkingCatalog}
+              value={selectedThinking(config.model, thinkingCatalog, thinkingSelections)}
+              onChange={(effort) =>
+                setThinkingSelections({ ...thinkingSelections, [config.model.trim()]: effort })
+              }
+            />
             <label>
               UFL API key (optional override)
               <input
@@ -526,6 +551,10 @@ export default function Agents({ request }: { request: Request }) {
                     setConfig({ ...config, max_output_tokens: Number(e.target.value) })
                   }
                 />
+                <small>
+                  Thinking and the answer share this limit when counted by the provider. Higher
+                  effort may need more tokens and a longer timeout.
+                </small>
               </label>
               <label>
                 Timeout (seconds)
@@ -587,7 +616,9 @@ export default function Agents({ request }: { request: Request }) {
                   {item.config.name}
                   <ChevronRight size={14} />
                 </strong>
-                <span>{item.config.model}</span>
+                <span>
+                  {item.config.model} · {effortLabel(item.config.thinking_effort)}
+                </span>
                 <small>
                   Levels {item.config.start_level}–{item.config.end_level}
                   <span className={`admin-status ${item.status}`}>
@@ -625,6 +656,8 @@ export default function Agents({ request }: { request: Request }) {
                   <h2>{run.config.name}</h2>
                   <p>
                     {run.config.provider} · {run.config.model}
+                    {' · Thinking: '}
+                    {effortLabel(run.config.thinking_effort)}
                   </p>
                 </div>
                 <span className={`admin-status ${run.status}`}>
@@ -951,6 +984,10 @@ export default function Agents({ request }: { request: Request }) {
                   </div>
                   <details className="agent-prompt">
                     <summary>Full request text</summary>
+                    {activeTurn.thinking_parameters &&
+                      Object.keys(activeTurn.thinking_parameters).length > 0 && (
+                        <pre>{JSON.stringify(activeTurn.thinking_parameters, null, 2)}</pre>
+                      )}
                     <pre>{activeTurn.system_prompt}</pre>
                     <pre>{activeTurn.prompt}</pre>
                   </details>
@@ -967,6 +1004,8 @@ export default function Agents({ request }: { request: Request }) {
                     {activeTurn.finish_reason && ` · Finish: ${activeTurn.finish_reason}`}
                     {activeTurn.max_output_tokens &&
                       ` · Output budget: ${activeTurn.max_output_tokens}`}
+                    {' · Thinking: '}
+                    {effortLabel(activeTurn.thinking_effort ?? run.config.thinking_effort)}
                   </p>
                 </div>
               )}

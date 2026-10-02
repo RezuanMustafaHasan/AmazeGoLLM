@@ -142,6 +142,145 @@ def test_image_check_sends_valid_png_and_checks_vision_reply(health_app):
 
 
 @pytest.mark.parametrize(
+    "model,effort,parameters",
+    [
+        ("gpt-6-luna", "none", {"reasoning_effort": "none"}),
+        ("gpt-6-luna", "max", {"reasoning_effort": "max"}),
+        ("gpt-6.1-sol", "xhigh", {"reasoning_effort": "xhigh"}),
+        ("gpt-6-astra", "max", {"reasoning_effort": "max"}),
+        ("gemini-3.8-flash", "low", {"reasoning_effort": "low"}),
+        ("gemini-3.8-flash", "high", {"reasoning_effort": "high"}),
+        (
+            "claude-opus-5.5",
+            "max",
+            {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}},
+        ),
+        (
+            "opus-5",
+            "xhigh",
+            {"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}},
+        ),
+        (
+            "fable-5.1",
+            "low",
+            {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}},
+        ),
+        (
+            "anthropic/claude-opus-5-5-20260901",
+            "max",
+            {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}},
+        ),
+    ],
+)
+def test_selected_thinking_reaches_gateway_with_native_parameters(
+    health_app, model, effort, parameters
+):
+    client, _, requests, _, _ = health_app
+    response = check(
+        client,
+        login(client),
+        model=model,
+        thinking_effort=effort,
+        max_output_tokens=8192,
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["status"] == "healthy"
+    assert result["thinking_effort"] == effort
+    assert result["thinking_parameters"] == parameters
+    body = json.loads(requests[0].content)
+    assert body == {
+        "model": model,
+        "messages": body["messages"],
+        "max_tokens": 8192,
+        **parameters,
+    }
+
+
+@pytest.mark.parametrize(
+    "model,effort",
+    [
+        ("gemini-3.8-flash", "max"),
+        ("gemini-3.8-flash", "none"),
+        ("gpt-6.1-sol", "none"),
+        ("gpt-6-astra", "none"),
+        ("claude-opus-5.5", "none"),
+        ("unverified-custom-model", "high"),
+        ("gpt-6-luna", "very-high"),
+    ],
+)
+def test_unsupported_thinking_is_rejected_before_gateway_or_run_creation(health_app, model, effort):
+    client, _, requests, _, store = health_app
+    csrf = login(client)
+    assert check(client, csrf, model=model, thinking_effort=effort).status_code == 422
+    response = client.post(
+        "/api/admin/agents",
+        headers=csrf,
+        json={
+            "name": "Invalid thinking",
+            "model": model,
+            "thinking_effort": effort,
+            "start_level": 1,
+            "end_level": 1,
+        },
+    )
+    assert response.status_code == 422
+    assert requests == []
+    assert store.players == {} and store.sessions == {} and store.agent_runs == {}
+
+
+def test_default_thinking_still_accepts_custom_models_and_sends_no_overrides(health_app):
+    client, _, requests, _, _ = health_app
+    result = check(
+        client,
+        login(client),
+        model="unverified-custom-model",
+        thinking_effort=None,
+    ).json()
+    assert result["status"] == "healthy" and result["thinking_parameters"] == {}
+    assert set(json.loads(requests[0].content)) == {"model", "messages"}
+
+
+def test_catalog_and_selected_thinking_are_saved_in_runs_transcripts_and_exports(health_app):
+    client, _, requests, reply, store = health_app
+    csrf = login(client)
+    catalog = client.get("/api/admin/agents/providers").json()["thinking_models"]
+    assert catalog == client.get("/api/admin/api-health").json()["thinking_models"]
+    assert "none" in catalog["gpt-6-luna"]["efforts"]
+    assert "none" not in catalog["gpt-6-astra"]["efforts"]
+    assert "max" in catalog["claude-opus-5.5"]["efforts"]
+    assert "max" not in catalog["gemini-3.8-flash"]["efforts"]
+    assert requests == []
+    run = client.post(
+        "/api/admin/agents",
+        headers=csrf,
+        json={
+            "name": "Max thinking",
+            "model": "claude-opus-5.5",
+            "thinking_effort": "max",
+            "start_level": 1,
+            "end_level": 1,
+        },
+    ).json()
+    reply["body"] = completion('{"arrow_id": 1}')
+    result = client.post(
+        f"/api/admin/agents/{run['id']}/step",
+        headers=csrf,
+        json={"request_id": str(uuid4())},
+    ).json()
+    assert result["status"] == "completed" and result["config"]["thinking_effort"] == "max"
+    parameters = {"thinking": {"type": "adaptive"}, "output_config": {"effort": "max"}}
+    body = json.loads(requests[0].content)
+    assert body["thinking"] == parameters["thinking"]
+    assert body["output_config"] == parameters["output_config"]
+    turn = store.list_agent_turns(run["id"])["items"][0]
+    assert turn["thinking_effort"] == "max" and turn["thinking_parameters"] == parameters
+    report = client.get(f"/api/admin/agents/{run['id']}/history/download").json()
+    assert report["run"]["config"]["thinking_effort"] == "max"
+    assert report["turns"][0]["thinking_parameters"] == parameters
+
+
+@pytest.mark.parametrize(
     "body",
     [
         completion(None),

@@ -238,6 +238,45 @@ has access to them. Gemini's preset ID is inferred from its
 display name; use the exact ID reported by UFL if it differs. Model IDs remain
 editable, and existing runs also route through UFL.
 
+In **Admin → Agents**, choose thinking effort before creating each session. The
+choices follow the selected model; switching models keeps a separate draft choice
+for each model while the panel is open. **Gateway default** omits every thinking
+override and preserves the behavior of older runs.
+
+| Models | Available explicit choices | UFL request parameters |
+| ------ | -------------------------- | ---------------------- |
+| GPT-6 Luna | Off (`none`), low, medium, high, extra high (`xhigh`), max | `reasoning_effort` |
+| GPT-6.1 Sol, GPT-6 Astra | low, medium, high, extra high, max | `reasoning_effort` |
+| Opus 5, Opus 5.5, Fable 5.1 | low, medium, high, extra high, max | `thinking: {"type":"adaptive"}` and `output_config.effort` |
+| Gemini 3.8 Flash | low, medium, high | `reasoning_effort`, mapped to Gemini's thinking level |
+
+The server provides the catalog to both admin screens and rejects unsupported
+model/effort combinations before creating a run or calling UFL. Equivalent native
+Claude IDs, provider-qualified names, and dated snapshots are recognized. Unknown
+custom IDs offer gateway default until their settings are added to
+`backend/app/model_thinking.py`. Existing runs without a thinking setting continue
+with gateway defaults. Each run, turn transcript, and performance export records
+the selected effort; new transcripts also record the exact thinking parameters
+sent to UFL.
+
+**Admin → API health** also offers a separate thinking selector for every model,
+plus an output token limit. Results are kept separately by model, check type,
+effort, and output limit so a default-effort check is not shown as a check of max effort. These
+checks use the same adapter as evaluations. A successful check establishes that
+the gateway accepted the request and returned the expected reply; it does not
+prove that UFL applied the setting upstream. Rejected settings are surfaced as
+errors without silently retrying at a different effort.
+
+Thinking may share the output token limit with the visible answer. Higher effort
+can therefore require a larger output cap and a longer timeout under **Request
+limits**. The current application cap remains 16,384 tokens per request.
+
+The catalog follows the official [GPT model documentation](https://developers.openai.com/api/docs/models/gpt-6-luna),
+[Claude effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort),
+and [Gemini thinking documentation](https://ai.google.dev/gemini-api/docs/thinking).
+Gateway forwarding depends on the deployed UFL/LiteLLM configuration; verify the
+chosen model and effort in API health before starting an evaluation.
+
 The server uses this request structure, with the current PNG in the user message:
 
 ```python
@@ -285,7 +324,7 @@ endpoints use the existing admin cookie and CSRF protection:
 | ------ | ----------------------------- | ------------------------------------ |
 | GET    | `/api/admin/api-health`       | Configuration and requested presets. |
 | POST   | `/api/admin/api-health/models` | Discover gateway model IDs.          |
-| POST   | `/api/admin/api-health/check`  | Check one model (`model`, `mode`, `timeout_seconds`). |
+| POST   | `/api/admin/api-health/check`  | Check one model (`model`, `mode`, `timeout_seconds`, optional `thinking_effort` and `max_output_tokens`). |
 
 **Single step** makes one model request. **Play** repeats turns while the panel
 stays open. **Pause** saves progress and lets an in-flight request finish;

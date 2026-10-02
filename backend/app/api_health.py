@@ -8,9 +8,15 @@ from uuid import uuid4
 from fastapi import APIRouter
 from openai import OpenAI
 from PIL import Image
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, model_validator
 
 from backend.app.engine import GameError, now_iso
+from backend.app.model_thinking import (
+    THINKING_MODELS,
+    ThinkingEffort,
+    thinking_parameters,
+    validate_thinking,
+)
 from backend.app.ufl import (
     MODEL_PRESETS,
     ModelId,
@@ -29,6 +35,13 @@ class HealthCheck(BaseModel):
     model: ModelId
     mode: Literal["text", "image"] = "text"
     timeout_seconds: StrictInt = Field(default=30, ge=5, le=120)
+    max_output_tokens: StrictInt | None = Field(default=None, ge=256, le=16384)
+    thinking_effort: ThinkingEffort | None = None
+
+    @model_validator(mode="after")
+    def thinking_settings(self):
+        validate_thinking(self.model, self.thinking_effort)
+        return self
 
 
 def connection(settings):
@@ -62,6 +75,7 @@ def api_health_router(settings, admin_dependency):
             "base_url": base_url,
             "configuration_error": error,
             "models": MODEL_PRESETS,
+            "thinking_models": THINKING_MODELS,
         }
 
     @router.post("/models")
@@ -101,6 +115,9 @@ def api_health_router(settings, admin_dependency):
         result = {
             "model": body.model,
             "mode": body.mode,
+            "thinking_effort": body.thinking_effort,
+            "thinking_parameters": thinking_parameters(body.model, body.thinking_effort),
+            "max_output_tokens": body.max_output_tokens,
             "status": "error",
             "checked_at": now_iso(),
             "latency_ms": None,
@@ -114,14 +131,15 @@ def api_health_router(settings, admin_dependency):
         }
         started = time.monotonic()
         try:
-            # Match the supplied sample: model + messages through chat.completions.
-            # No provider-specific parameters or automatic retries are added.
+            # Use the same adapter and thinking controls as puzzle evaluations.
             response = complete(
                 base_url=url,
                 api_key=key,
                 model=body.model,
                 messages=[{"role": "user", "content": content}],
                 timeout_seconds=body.timeout_seconds,
+                max_output_tokens=body.max_output_tokens,
+                thinking_effort=body.thinking_effort,
             )
             text = completion_text(response)
             # Never return a key even if a gateway accidentally echoes it in text.

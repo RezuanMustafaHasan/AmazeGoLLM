@@ -124,6 +124,7 @@ def invoke_model(config, api_key, prompt, png, *, base_url):
         model=config["model"],
         timeout_seconds=config["timeout_seconds"],
         max_output_tokens=config["max_output_tokens"],
+        thinking_effort=config.get("thinking_effort"),
         messages=[
             {"role": "system", "content": RULES},
             {"role": "user", "content": image_content(prompt, png)},

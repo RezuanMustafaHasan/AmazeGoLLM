@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Activity, CheckCircle2, LoaderCircle, RefreshCw, Search, XCircle } from 'lucide-react'
+import ThinkingControl from './ThinkingControl'
+import {
+  effortLabel,
+  healthResultKey,
+  selectedThinking,
+  type ThinkingCatalog,
+  type ThinkingSelections,
+} from './modelThinking'
 
 type Request = <T>(path: string, options?: RequestInit) => Promise<T>
 interface Model {
@@ -13,6 +21,7 @@ interface Configuration {
   base_url: string | null
   configuration_error: string | null
   models: Model[]
+  thinking_models: ThinkingCatalog
 }
 interface Diagnostic {
   code: string
@@ -23,6 +32,8 @@ interface Diagnostic {
 interface Result {
   model: string
   mode: 'text' | 'image'
+  thinking_effort: string | null
+  max_output_tokens: number | null
   status: 'healthy' | 'warning' | 'error'
   checked_at: string
   latency_ms: number | null
@@ -36,13 +47,14 @@ interface Result {
 }
 const message = (error: unknown) =>
   error instanceof Error ? error.message : 'The check could not be completed.'
-const resultKey = (model: string, mode: string) => `${mode}:${model}`
 
 export default function ApiHealth({ request }: { request: Request }) {
   const [config, setConfig] = useState<Configuration | null>(null)
   const [models, setModels] = useState<Model[]>([])
   const [mode, setMode] = useState<'text' | 'image'>('text')
   const [timeout, setTimeoutSeconds] = useState(30)
+  const [outputLimit, setOutputLimit] = useState(4096)
+  const [thinkingSelections, setThinkingSelections] = useState<ThinkingSelections>({})
   const [customModel, setCustomModel] = useState('')
   const [discovered, setDiscovered] = useState<string[] | null>(null)
   const [results, setResults] = useState<Record<string, Result>>({})
@@ -82,13 +94,27 @@ export default function ApiHealth({ request }: { request: Request }) {
       for (const model of selected) {
         if (!mounted.current) break
         setChecking(model.id)
+        const thinkingEffort = selectedThinking(
+          model.id,
+          config.thinking_models,
+          thinkingSelections,
+        )
         const result = await request<Result>('/api-health/check', {
           method: 'POST',
-          body: JSON.stringify({ model: model.id, mode, timeout_seconds: timeout }),
+          body: JSON.stringify({
+            model: model.id,
+            mode,
+            timeout_seconds: timeout,
+            max_output_tokens: outputLimit,
+            thinking_effort: thinkingEffort,
+          }),
           signal: AbortSignal.timeout((timeout + 15) * 1000),
         })
         if (!mounted.current) break
-        setResults((previous) => ({ ...previous, [resultKey(model.id, mode)]: result }))
+        setResults((previous) => ({
+          ...previous,
+          [healthResultKey(model.id, mode, thinkingEffort, outputLimit)]: result,
+        }))
       }
     } catch (err) {
       if (mounted.current) setError(message(err))
@@ -125,7 +151,20 @@ export default function ApiHealth({ request }: { request: Request }) {
     }
   }
 
-  const visibleResults = models.map((m) => results[resultKey(m.id, mode)]).filter(Boolean)
+  const catalog = config?.thinking_models ?? {}
+  const visibleResults = models
+    .map(
+      (m) =>
+        results[
+          healthResultKey(
+            m.id,
+            mode,
+            selectedThinking(m.id, catalog, thinkingSelections),
+            outputLimit,
+          )
+        ],
+    )
+    .filter(Boolean)
   const healthy = visibleResults.filter((result) => result.status === 'healthy').length
 
   return (
@@ -210,6 +249,17 @@ export default function ApiHealth({ request }: { request: Request }) {
               ))}
             </select>
           </label>
+          <label>
+            Output token limit
+            <input
+              type="number"
+              min={256}
+              max={16384}
+              value={outputLimit}
+              disabled={busy}
+              onChange={(e) => setOutputLimit(Number(e.target.value))}
+            />
+          </label>
           <button
             className="admin-secondary"
             disabled={busy || !config?.configured}
@@ -279,7 +329,8 @@ export default function ApiHealth({ request }: { request: Request }) {
 
         <div className="health-models" aria-live="polite" aria-busy={busy}>
           {models.map((model) => {
-            const result = results[resultKey(model.id, mode)]
+            const thinkingEffort = selectedThinking(model.id, catalog, thinkingSelections)
+            const result = results[healthResultKey(model.id, mode, thinkingEffort, outputLimit)]
             const pending = checking === model.id
             return (
               <article className="health-model" key={model.id}>
@@ -317,12 +368,24 @@ export default function ApiHealth({ request }: { request: Request }) {
                     Check
                   </button>
                 </div>
+                <ThinkingControl
+                  model={model.id}
+                  catalog={catalog}
+                  value={thinkingEffort}
+                  disabled={busy}
+                  onChange={(effort) =>
+                    setThinkingSelections({ ...thinkingSelections, [model.id.trim()]: effort })
+                  }
+                />
                 {result && (
                   <div className="health-result">
                     <p className="health-result-meta">
                       {result.latency_ms ?? '—'} ms · {result.usage.total_tokens ?? '—'} tokens ·{' '}
                       {new Date(result.checked_at).toLocaleString()}
                       {result.finish_reason && ` · finish: ${result.finish_reason}`}
+                      {' · Thinking: '}
+                      {effortLabel(result.thinking_effort)}
+                      {result.max_output_tokens && ` · Output limit: ${result.max_output_tokens}`}
                       {result.error?.http_status && ` · HTTP ${result.error.http_status}`}
                     </p>
                     {result.response_model && result.response_model !== model.id && (

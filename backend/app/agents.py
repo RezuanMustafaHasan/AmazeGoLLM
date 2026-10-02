@@ -31,6 +31,12 @@ from backend.app.engine import (
     now_iso,
     observation,
 )
+from backend.app.model_thinking import (
+    THINKING_MODELS,
+    ThinkingEffort,
+    thinking_parameters,
+    validate_thinking,
+)
 from backend.app.ufl import ModelId, gateway_key, gateway_url
 
 
@@ -40,6 +46,7 @@ class CreateAgentRun(BaseModel):
     # Accept old provider labels for existing clients; all calls now use UFL.
     provider: Literal["ufl", "gemini", "anthropic", "openai", "deepseek", "kimi"] = "ufl"
     model: ModelId
+    thinking_effort: ThinkingEffort | None = None
     start_level: StrictInt = Field(ge=1, le=100000)
     end_level: StrictInt = Field(ge=1, le=100000)
     lives: StrictInt = Field(default=3, ge=1, le=100)
@@ -51,6 +58,7 @@ class CreateAgentRun(BaseModel):
 
     @model_validator(mode="after")
     def ordered_range(self):
+        validate_thinking(self.model, self.thinking_effort)
         if self.end_level < self.start_level:
             raise ValueError("The end level must be at least the start level.")
         if self.end_level - self.start_level >= 1000:
@@ -277,6 +285,10 @@ class AgentRunner:
                     "usage": {},
                     "latency_ms": None,
                     "diagnostic": None,
+                    "thinking_effort": run["config"].get("thinking_effort"),
+                    "thinking_parameters": thinking_parameters(
+                        run["config"]["model"], run["config"].get("thinking_effort")
+                    ),
                     "max_output_tokens": run.get(
                         "request_max_output_tokens", run["config"]["max_output_tokens"]
                     ),
@@ -469,7 +481,7 @@ def agent_router(admin_dependency):
 
     @router.get("/providers")
     def providers(request: Request):
-        return {"providers": runner(request).providers()}
+        return {"providers": runner(request).providers(), "thinking_models": THINKING_MODELS}
 
     @router.get("")
     def runs(request: Request, limit: int = 100, cursor: UUID | None = None):
