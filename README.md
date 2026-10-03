@@ -216,10 +216,30 @@ in-memory/API observations; they are not persisted to Firestore.
 ## LLM evaluations in the admin panel
 
 Open `/admin` and choose **LLM agents**. Create a named evaluation with a model preset,
-editable model ID, contiguous level range, and 1–100 lives per level. Each run has
+editable model ID, problem selection, and 1–100 lives per level. Each run has
 its own player identity; each level has a separate attempt and a fresh life budget.
 Wins and losses both advance to the next selected level. Runs and transcripts
 persist in Firestore; memory mode remains temporary.
+
+Under **Problems to run**, choose either **Level range** or **By category**.
+Category runs support Easy, Medium, Hard, and Expert. Select **First N problems**
+and a count (for example, the first 10 Easy problems), or **All problems in
+category** (for example, every Expert problem). Matching levels run in ascending
+level-number order, even when levels from other categories occur between them.
+The form shows the available category counts and previews the selected levels.
+
+Selections are limited to 1,000 problems per run. Empty categories and counts
+larger than the available category are rejected before a player or attempt is
+created. The run stores the resolved level IDs, category, and optional count;
+saved runs and performance downloads preserve that selection. Existing clients
+that submit `start_level` and `end_level` continue to create range runs.
+
+For category runs, `POST /api/admin/agents` accepts
+`selection_mode: "category"`, `difficulty: "easy" | "medium" | "hard" | "expert"`,
+and optional `level_limit`. Omit `level_limit` or set it to `null` to select the
+entire category; use a positive integer for the first N matches. Omit range fields
+or set them to `null`. Range runs use `selection_mode: "range"` (the default),
+`start_level`, and `end_level`.
 
 All model families use the same UFL OpenAI-compatible Chat Completions API, matching
 the supplied `run_navapi.py` format. Set these **server environment variables** in
@@ -269,7 +289,9 @@ errors without silently retrying at a different effort.
 
 Thinking may share the output token limit with the visible answer. Higher effort
 can therefore require a larger output cap and a longer timeout under **Request
-limits**. The current application cap remains 16,384 tokens per request.
+limits**. The application allows up to 64,000 output tokens per request, matching
+the limit UFL advertises for `claude-opus-5.5`. A selected gateway model can have
+a lower limit. Thinking effort stays at the value selected for the evaluation.
 
 The catalog follows the official [GPT model documentation](https://developers.openai.com/api/docs/models/gpt-6-luna),
 [Claude effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort),
@@ -326,12 +348,13 @@ endpoints use the existing admin cookie and CSRF protection:
 | POST   | `/api/admin/api-health/models` | Discover gateway model IDs.          |
 | POST   | `/api/admin/api-health/check`  | Check one model (`model`, `mode`, `timeout_seconds`, optional `thinking_effort` and `max_output_tokens`). |
 
-**Single step** makes one model request. **Play** repeats turns while the panel
-stays open. **Pause** saves progress and lets an in-flight request finish;
+**Single step** makes one model request. **Play** repeats turns while the admin
+browser page stays open, including when switching admin sections.
+**Pause** saves progress and lets an in-flight request finish;
 **Resume session** continues the saved attempt later, including after reopening
 the panel or stopping. **Stop** discards an
-in-flight decision if it has not already been applied. Autoplay stops when leaving
-the panel and requires pressing Continue or Resume again after reopening. There is no background
+in-flight decision if it has not already been applied. Closing or reloading the
+browser page requires pressing Continue or Resume again after reopening. There is no background
 worker or unattended billing after the panel closes. A submitted request can still
 finish after closing the browser. The dashboard displays the current labelled
 PNG, lives, moves, mistakes, level outcomes, and paginated turn transcripts with
@@ -353,12 +376,24 @@ empty, truncated, malformed, and unknown-arrow responses leave the board, lives,
 moves, and mistakes unchanged. They remain visible in the transcript as unscored
 response failures. The next request names the last tapped arrow,
 its blocker where applicable, the lost life, and lives remaining. Transport,
-timeouts, connection errors, HTTP 408/409/429 and server errors use bounded
+timeouts, connection errors, HTTP 408/409/429 and server errors use persistent
 automatic recovery during autoplay, with exponential backoff and the provider's
-`Retry-After` delay when supplied. Three consecutive failures halt autoplay until
-the admin resumes. Authentication, access, bad request, and refusal errors require
-admin attention immediately. No provider failure scores a mistake. An exhausted
-output budget doubles for the next request, up to 16,384 tokens. Finish reasons,
+`Retry-After` delay when supplied. There is no consecutive-failure cutoff:
+retries continue until the admin pauses or stops the run, or the evaluation ends.
+The backoff grows from five seconds to a maximum of sixty seconds; a longer
+provider `Retry-After` takes precedence. Authentication, access, bad request, and
+refusal errors stay visible and are rechecked every five minutes so that a run
+can recover when the upstream problem is fixed. Browser/network failures retry
+the same UUID without a retry limit. Interrupted server/storage requests keep
+the admin's running state and recover saved responses and game receipts.
+No provider failure scores a mistake. After a timeout, the next request's
+timeout doubles, up to 180 seconds; its effective allowance is recorded in the
+transcript and respected by the browser. An exhausted
+output budget doubles for the next request, up to 64,000 tokens. Complete,
+validated JSON moves are applied even if the provider reports a length stop;
+missing or incomplete moves retry without scoring. The dashboard and failed
+turns record the actual next budget, including when it has reached the ceiling.
+Finish reasons,
 effective output budgets, and safe error categories/HTTP statuses are logged.
 Output-token, request-timeout, and per-level turn limits are configurable.
 Only image-capable model IDs work; rejected image inputs are never silently

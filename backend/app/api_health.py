@@ -10,6 +10,7 @@ from openai import OpenAI
 from PIL import Image
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, TypeAdapter, model_validator
 
+from backend.app.agent_recovery import MAX_OUTPUT_TOKENS
 from backend.app.engine import GameError, now_iso
 from backend.app.model_thinking import (
     THINKING_MODELS,
@@ -35,7 +36,7 @@ class HealthCheck(BaseModel):
     model: ModelId
     mode: Literal["text", "image"] = "text"
     timeout_seconds: StrictInt = Field(default=30, ge=5, le=120)
-    max_output_tokens: StrictInt | None = Field(default=None, ge=256, le=16384)
+    max_output_tokens: StrictInt | None = Field(default=None, ge=256, le=MAX_OUTPUT_TOKENS)
     thinking_effort: ThinkingEffort | None = None
 
     @model_validator(mode="after")

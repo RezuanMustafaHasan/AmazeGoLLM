@@ -18,7 +18,18 @@ import {
   ZoomOut,
 } from 'lucide-react'
 import type { GameState, LevelSummary } from './types'
-import { canResume, nextTurnDelay } from './agentPlayback'
+import { canResume, clientRetryDelay, nextTurnDelay } from './agentPlayback'
+import {
+  categoryLabel,
+  initialLevelSelection,
+  levelSelectionLabel,
+  problemCategories,
+  selectedAgentLevels,
+  selectionError,
+  selectionPayload,
+  type SelectionConfig,
+  type SelectionForm,
+} from './agentLevelSelection'
 import ThinkingControl from './ThinkingControl'
 import {
   effortLabel,
@@ -37,13 +48,11 @@ interface Provider {
   base_url_configured: boolean
   env: string
 }
-interface Config {
+interface Config extends SelectionConfig {
   name: string
   provider: string
   model: string
   thinking_effort?: string | null
-  start_level: number
-  end_level: number
   lives: number
   observation_mode: 'image_only' | 'image_and_state'
   max_turns_per_level: number
@@ -72,6 +81,7 @@ interface Run {
   retry_at?: number | null
   consecutive_failures?: number
   request_max_output_tokens?: number
+  request_timeout_seconds?: number
   created_at: string
 }
 interface Detail extends Run {
@@ -129,8 +139,6 @@ const initialConfig: Config = {
   name: 'Visual puzzle agent',
   provider: 'ufl',
   model: 'gpt-6-luna',
-  start_level: 1,
-  end_level: 1,
   lives: 3,
   observation_mode: 'image_only',
   max_turns_per_level: 2000,
@@ -152,6 +160,7 @@ export default function Agents({ request }: { request: Request }) {
   const [turns, setTurns] = useState<Turns>({ items: [], next_before: null })
   const [selectedTurn, setSelectedTurn] = useState<Turn | null>(null)
   const [config, setConfig] = useState(initialConfig)
+  const [selection, setSelection] = useState(initialLevelSelection)
   const [apiKey, setApiKey] = useState('')
   const [showSetup, setShowSetup] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -248,6 +257,7 @@ export default function Agents({ request }: { request: Request }) {
         method: 'POST',
         body: JSON.stringify({
           ...config,
+          ...selectionPayload(selection),
           thinking_effort: selectedThinking(config.model, thinkingCatalog, thinkingSelections),
           ...(apiKey ? { api_key: apiKey } : {}),
         }),
@@ -282,24 +292,28 @@ export default function Agents({ request }: { request: Request }) {
       const detail = await request<Detail>(`/agents/${id}/step`, {
         method: 'POST',
         body: JSON.stringify({ request_id: requestId }),
-        signal: AbortSignal.timeout((run.config.timeout_seconds + 60) * 1000),
+        signal: AbortSignal.timeout(
+          ((run.request_timeout_seconds ?? run.config.timeout_seconds) + 60) * 1000,
+        ),
       })
+      if (!mounted.current || selectedId.current !== id) return
       retryId.current = null
       clientFailures.current = 0
       setClientRetryAt(0)
-      if (!mounted.current || selectedId.current !== id) return
       setRun(detail)
       if (detail.status !== 'running') setAuto(false)
       await load(id)
     } catch (err) {
       if (mounted.current && selectedId.current === id) {
         const latest = await load(id).catch(() => undefined)
+        if (!mounted.current || selectedId.current !== id) return
         clientFailures.current += 1
-        const retry = clientFailures.current < 3 && (!latest || latest.status === 'running')
+        const retry = (latest ?? run).status === 'running'
         if (!retry) setAuto(false)
-        setClientRetryAt(Date.now() + 5000 * 2 ** (clientFailures.current - 1))
+        setClientRetryAt(Date.now() + clientRetryDelay(clientFailures.current))
         setError(
-          errorMessage(err) + (retry ? ' Retrying the same request safely.' : ' Resume to retry.'),
+          errorMessage(err) +
+            (retry ? ' Retrying the same request safely; no retry limit.' : ' Resume to retry.'),
         )
       }
     } finally {
@@ -311,7 +325,7 @@ export default function Agents({ request }: { request: Request }) {
   useEffect(() => {
     if (!auto || busy || !run || run.status !== 'running') return
     const wait = Math.max(
-      nextTurnDelay(delay, run.retry_at, Date.now()),
+      nextTurnDelay(delay, run.retry_at, Date.now(), run.in_flight ? run.lease_expires_at : null),
       clientRetryAt - Date.now(),
     )
     const timer = window.setTimeout(() => void step(), wait)
@@ -349,6 +363,9 @@ export default function Agents({ request }: { request: Request }) {
   }
 
   const provider = providers.find((p) => p.id === config.provider)
+  const selectedLevels = selectedAgentLevels(levels, selection)
+  const problemSelectionError = selectionError(levels, selection)
+  const categoryCount = levels.filter((level) => level.difficulty === selection.difficulty).length
   const ended = run?.status === 'completed' || run?.status === 'stopped'
   const activeTurn =
     turns.items.find((turn) => turn.id === selectedTurn?.id) ?? selectedTurn ?? turns.items[0]
@@ -387,7 +404,7 @@ export default function Agents({ request }: { request: Request }) {
           <div className="admin-card-heading">
             <div>
               <h2>Create an agent session</h2>
-              <p>Select the model, levels, and life budget.</p>
+              <p>Select the model, problems, and life budget.</p>
             </div>
             <Bot size={22} />
           </div>
@@ -474,28 +491,6 @@ export default function Agents({ request }: { request: Request }) {
               </small>
             </label>
             <label>
-              From level
-              <input
-                required
-                type="number"
-                min={levels[0]?.number ?? 1}
-                max={levels.at(-1)?.number ?? 1000}
-                value={config.start_level}
-                onChange={(e) => setConfig({ ...config, start_level: Number(e.target.value) })}
-              />
-            </label>
-            <label>
-              Through level
-              <input
-                required
-                type="number"
-                min={config.start_level}
-                max={levels.at(-1)?.number ?? 1000}
-                value={config.end_level}
-                onChange={(e) => setConfig({ ...config, end_level: Number(e.target.value) })}
-              />
-            </label>
-            <label>
               Lives per level
               <input
                 required
@@ -523,6 +518,124 @@ export default function Agents({ request }: { request: Request }) {
               <small>Both include rules and previous-action feedback.</small>
             </label>
           </div>
+          <fieldset className="agent-level-selection">
+            <legend>Problems to run</legend>
+            <div className="agent-form-grid">
+              <label>
+                Problem selection
+                <select
+                  value={selection.mode}
+                  onChange={(e) =>
+                    setSelection({ ...selection, mode: e.target.value as SelectionForm['mode'] })
+                  }
+                >
+                  <option value="range">Level range</option>
+                  <option value="category">By category</option>
+                </select>
+              </label>
+              {selection.mode === 'range' ? (
+                <>
+                  <label>
+                    From level
+                    <input
+                      required
+                      type="number"
+                      min={levels[0]?.number ?? 1}
+                      max={levels.at(-1)?.number ?? 100000}
+                      value={selection.start}
+                      onChange={(e) =>
+                        setSelection({ ...selection, start: Number(e.target.value) })
+                      }
+                    />
+                  </label>
+                  <label>
+                    Through level
+                    <input
+                      required
+                      type="number"
+                      min={selection.start}
+                      max={levels.at(-1)?.number ?? 100000}
+                      value={selection.end}
+                      onChange={(e) => setSelection({ ...selection, end: Number(e.target.value) })}
+                    />
+                  </label>
+                </>
+              ) : (
+                <>
+                  <label>
+                    Category
+                    <select
+                      value={selection.difficulty}
+                      onChange={(e) =>
+                        setSelection({
+                          ...selection,
+                          difficulty: e.target.value as SelectionForm['difficulty'],
+                        })
+                      }
+                    >
+                      {problemCategories.map((category) => (
+                        <option key={category} value={category}>
+                          {categoryLabel(category)} (
+                          {levels.filter((level) => level.difficulty === category).length}{' '}
+                          available)
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    Category scope
+                    <select
+                      value={selection.scope}
+                      onChange={(e) =>
+                        setSelection({
+                          ...selection,
+                          scope: e.target.value as SelectionForm['scope'],
+                        })
+                      }
+                    >
+                      <option value="first">First N problems</option>
+                      <option value="all">All problems in category</option>
+                    </select>
+                  </label>
+                  {selection.scope === 'first' && (
+                    <label>
+                      Number of problems
+                      <input
+                        required
+                        type="number"
+                        min={1}
+                        max={Math.min(categoryCount, 1000)}
+                        value={selection.count}
+                        onChange={(e) =>
+                          setSelection({ ...selection, count: Number(e.target.value) })
+                        }
+                      />
+                    </label>
+                  )}
+                </>
+              )}
+            </div>
+            <p className="agent-selection-preview" role="status">
+              {problemSelectionError ?? (
+                <>
+                  <strong>
+                    {levelSelectionLabel(selectionPayload(selection), selectedLevels.length)}
+                  </strong>
+                  {' · '}
+                  {selectedLevels.length} {selectedLevels.length === 1 ? 'problem' : 'problems'} in
+                  ascending level order.
+                  <span>
+                    Selected levels:{' '}
+                    {selectedLevels
+                      .slice(0, 6)
+                      .map((level) => level.number)
+                      .join(', ')}
+                    {selectedLevels.length > 6 && `, …, ${selectedLevels.at(-1)?.number}`}
+                  </span>
+                </>
+              )}
+            </p>
+          </fieldset>
           <details className="agent-advanced">
             <summary>Request limits</summary>
             <div className="agent-form-grid">
@@ -545,7 +658,7 @@ export default function Agents({ request }: { request: Request }) {
                   type="number"
                   required
                   min={256}
-                  max={16384}
+                  max={64000}
                   value={config.max_output_tokens}
                   onChange={(e) =>
                     setConfig({ ...config, max_output_tokens: Number(e.target.value) })
@@ -578,7 +691,12 @@ export default function Agents({ request }: { request: Request }) {
             <button
               className="admin-primary"
               type="submit"
-              disabled={busy || !providers.length || !provider?.base_url_configured}
+              disabled={
+                busy ||
+                !providers.length ||
+                !provider?.base_url_configured ||
+                !!problemSelectionError
+              }
             >
               {busy ? <LoaderCircle size={16} className="admin-spin" /> : <Plus size={16} />}
               Create session
@@ -620,7 +738,7 @@ export default function Agents({ request }: { request: Request }) {
                   {item.config.model} · {effortLabel(item.config.thinking_effort)}
                 </span>
                 <small>
-                  Levels {item.config.start_level}–{item.config.end_level}
+                  {levelSelectionLabel(item.config, item.level_ids.length)}
                   <span className={`admin-status ${item.status}`}>
                     {run?.id === item.id ? run.status : item.status}
                   </span>
@@ -659,6 +777,7 @@ export default function Agents({ request }: { request: Request }) {
                     {' · Thinking: '}
                     {effortLabel(run.config.thinking_effort)}
                   </p>
+                  <p>{levelSelectionLabel(run.config, run.level_ids.length)}</p>
                 </div>
                 <span className={`admin-status ${run.status}`}>
                   {run.in_flight ? 'Request in progress' : run.status}
@@ -729,8 +848,10 @@ export default function Agents({ request }: { request: Request }) {
               </div>
               <p className="agent-play-note">
                 Pause saves progress after the current request finishes. Resume continues this
-                session later, including after reopening the panel. Autoplay runs while this panel
-                stays open. Temporary failures retry up to three consecutive failed requests.
+                session later, including after reopening the panel. Autoplay continues when you
+                switch admin sections while this browser page stays open. Failures retry
+                automatically with no retry limit until you pause or stop. Configuration and access
+                errors are rechecked every five minutes.
               </p>
               {run.error && (
                 <div className="admin-error" role="alert">
@@ -742,7 +863,11 @@ export default function Agents({ request }: { request: Request }) {
                       {run.status === 'running' &&
                         run.retry_at &&
                         ` · Next retry after ${new Date(run.retry_at * 1000).toLocaleTimeString()}`}
-                      {` · Consecutive failures: ${run.consecutive_failures ?? 0}/3`}
+                      {` · Consecutive failures: ${run.consecutive_failures ?? 0} · No retry limit`}
+                      {run.diagnostic.code === 'timeout' &&
+                        ` · Next request timeout: ${run.request_timeout_seconds ?? run.config.timeout_seconds}s`}
+                      {run.diagnostic.code === 'output_limit' &&
+                        ` · Next output budget: ${(run.request_max_output_tokens ?? run.config.max_output_tokens).toLocaleString()} tokens`}
                     </p>
                   )}
                 </div>

@@ -37,6 +37,8 @@ GAME RULES (apply on every turn):
    answers, and API failures are retried without changing the board or lives.
    At zero lives the level attempt ends in a loss. Each new level resets lives.
 6. No hints or solver are available. Infer a safe tap from the attached image.
+   Evaluate candidates until you find one clear arrow. This request is for one
+   move; the next request will supply the updated board.
 7. Use feedback from the previous action. Choose from the remaining arrow IDs.
 OUTPUT CONTRACT: Return only a JSON object, for example:
 {"arrow_id": 12, "explanation": "Its forward lane appears clear."}
@@ -106,7 +108,8 @@ def build_prompt(session, state, mode, response_feedback=None):
         + (
             f"\nPrevious request failed: {response_feedback} "
             'Return exactly one JSON object, e.g. {"arrow_id": 12}. '
-            "Keep the explanation brief."
+            "Choose one move from this image. Return arrow_id first, with at most one "
+            "short sentence of explanation."
             if response_feedback
             else ""
         )

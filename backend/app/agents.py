@@ -16,8 +16,8 @@ from backend.app.agent_export import performance_report
 from backend.app.agent_image import render_board
 from backend.app.agent_llm import PROVIDERS, RULES, build_prompt, invoke_model, parse_decision
 from backend.app.agent_recovery import (
-    MAX_CONSECUTIVE_FAILURES,
     MAX_OUTPUT_TOKENS,
+    MAX_TIMEOUT_SECONDS,
     provider_diagnostic,
     response_diagnostic,
     retry_delay,
@@ -47,22 +47,35 @@ class CreateAgentRun(BaseModel):
     provider: Literal["ufl", "gemini", "anthropic", "openai", "deepseek", "kimi"] = "ufl"
     model: ModelId
     thinking_effort: ThinkingEffort | None = None
-    start_level: StrictInt = Field(ge=1, le=100000)
-    end_level: StrictInt = Field(ge=1, le=100000)
+    selection_mode: Literal["range", "category"] = "range"
+    start_level: StrictInt | None = Field(default=None, ge=1, le=100000)
+    end_level: StrictInt | None = Field(default=None, ge=1, le=100000)
+    difficulty: Literal["easy", "medium", "hard", "expert"] | None = None
+    level_limit: StrictInt | None = Field(default=None, ge=1, le=1000)
     lives: StrictInt = Field(default=3, ge=1, le=100)
     observation_mode: Literal["image_only", "image_and_state"] = "image_only"
     max_turns_per_level: StrictInt = Field(default=2000, ge=1, le=10000)
-    max_output_tokens: StrictInt = Field(default=4096, ge=256, le=16384)
+    max_output_tokens: StrictInt = Field(default=4096, ge=256, le=MAX_OUTPUT_TOKENS)
     timeout_seconds: StrictInt = Field(default=90, ge=10, le=180)
     api_key: SecretStr | None = Field(default=None, max_length=4096)
 
     @model_validator(mode="after")
-    def ordered_range(self):
+    def selection_settings(self):
         validate_thinking(self.model, self.thinking_effort)
-        if self.end_level < self.start_level:
-            raise ValueError("The end level must be at least the start level.")
-        if self.end_level - self.start_level >= 1000:
-            raise ValueError("Select at most 1000 levels per agent session.")
+        if self.selection_mode == "range":
+            if self.start_level is None or self.end_level is None:
+                raise ValueError("Choose a start and end level for a range selection.")
+            if self.difficulty is not None or self.level_limit is not None:
+                raise ValueError("Category and problem count only apply to category selections.")
+            if self.end_level < self.start_level:
+                raise ValueError("The end level must be at least the start level.")
+            if self.end_level - self.start_level >= 1000:
+                raise ValueError("Select at most 1000 levels per agent session.")
+        else:
+            if self.difficulty is None:
+                raise ValueError("Choose a category for a category selection.")
+            if self.start_level is not None or self.end_level is not None:
+                raise ValueError("Start and end levels only apply to range selections.")
         return self
 
 
@@ -110,13 +123,29 @@ class AgentRunner:
 
     def create(self, body):
         gateway_url(self.settings)
-        levels = [
-            level
-            for level in self.store.all_levels()
-            if body.start_level <= level.number <= body.end_level
-        ]
-        if [level.number for level in levels] != list(range(body.start_level, body.end_level + 1)):
-            raise GameError("Choose a contiguous range of available catalog levels.", 422)
+        catalog = sorted(self.store.all_levels(), key=lambda level: level.number)
+        if body.selection_mode == "category":
+            levels = [level for level in catalog if level.difficulty == body.difficulty]
+            if not levels:
+                raise GameError(f"No {body.difficulty} problems are available.", 422)
+            if body.level_limit is not None:
+                if body.level_limit > len(levels):
+                    raise GameError(
+                        f"Only {len(levels)} {body.difficulty} problems are available. "
+                        "Choose a smaller count or all problems.",
+                        422,
+                    )
+                levels = levels[: body.level_limit]
+            if len(levels) > 1000:
+                raise GameError("Select at most 1000 levels per agent session.", 422)
+        else:
+            levels = [
+                level for level in catalog if body.start_level <= level.number <= body.end_level
+            ]
+            if [level.number for level in levels] != list(
+                range(body.start_level, body.end_level + 1)
+            ):
+                raise GameError("Choose a contiguous range of available catalog levels.", 422)
         key = body.api_key.get_secret_value().strip() if body.api_key else None
         key = key or gateway_key(self.settings)
         if not key:
@@ -148,6 +177,7 @@ class AgentRunner:
             "retry_at": None,
             "response_feedback": None,
             "request_max_output_tokens": body.max_output_tokens,
+            "request_timeout_seconds": body.timeout_seconds,
             "created_at": now_iso(),
             "updated_at": now_iso(),
         }
@@ -195,7 +225,7 @@ class AgentRunner:
         if previous and previous["status"] in {"finished", "error", "invalid", "cancelled"}:
             return self.detail(run_id)
         current = self.store.get_agent_run(run_id)
-        if (current.get("retry_at") or 0) > time.time() and not current.get("pending"):
+        if (current.get("retry_at") or 0) > time.time():
             return self.detail(run_id)
         lease = str(uuid4())
 
@@ -203,7 +233,7 @@ class AgentRunner:
             if run["status"] in {"completed", "stopped"}:
                 raise GameError("This agent session has ended.")
             pending = run.get("pending")
-            if not pending and (run.get("retry_at") or 0) > time.time():
+            if (run.get("retry_at") or 0) > time.time():
                 raise GameError("Waiting before retrying the model request.", 409)
             if pending and pending["expires_at"] > time.time():
                 raise GameError("An LLM turn is already in progress. Wait for its result.")
@@ -292,10 +322,14 @@ class AgentRunner:
                     "max_output_tokens": run.get(
                         "request_max_output_tokens", run["config"]["max_output_tokens"]
                     ),
+                    "timeout_seconds": run.get(
+                        "request_timeout_seconds", run["config"]["timeout_seconds"]
+                    ),
                 }
                 self._save(run_id, lease, turn)
             if turn["raw_response"] is None:
                 turn.setdefault("max_output_tokens", run["config"]["max_output_tokens"])
+                turn.setdefault("timeout_seconds", run["config"]["timeout_seconds"])
                 try:
                     key = self.cipher().decrypt(run["credential"].encode()).decode()
                 except InvalidToken:
@@ -307,7 +341,11 @@ class AgentRunner:
                 started = time.monotonic()
                 try:
                     response = self.invoke(
-                        {**run["config"], "max_output_tokens": turn["max_output_tokens"]},
+                        {
+                            **run["config"],
+                            "max_output_tokens": turn["max_output_tokens"],
+                            "timeout_seconds": turn["timeout_seconds"],
+                        },
                         key,
                         turn["prompt"],
                         render_board(state),
@@ -371,13 +409,25 @@ class AgentRunner:
             )
             return self._finish(run_id, lease, turn, updated)
         except Exception:
-            # Release the lease on infrastructure errors; a persisted response can be retried.
+            # Keep admin intent and recover the same turn after infrastructure errors.
             def release(current):
                 if current.get("pending") and current["pending"]["lease"] == lease:
                     current["pending"]["expires_at"] = 0
-                    if current["status"] != "stopped":
-                        current["status"] = "paused"
                     current["in_flight"] = False
+                    diagnostic = {
+                        "code": "infrastructure_error",
+                        "message": "A server or storage error interrupted this turn. "
+                        "The next request will recover saved progress.",
+                        "retryable": True,
+                    }
+                    failures = current.get("consecutive_failures", 0) + 1
+                    current.update(
+                        consecutive_failures=failures,
+                        diagnostic=diagnostic,
+                        error=diagnostic["message"],
+                        retry_at=time.time() + retry_delay(failures, diagnostic),
+                        updated_at=now_iso(),
+                    )
                 return current, None
 
             self.store.mutate_agent_run(run_id, release)
@@ -424,15 +474,19 @@ class AgentRunner:
                 )
                 if diagnostic["code"] == "output_limit":
                     budget = turn.get("max_output_tokens", run["config"]["max_output_tokens"])
-                    run["request_max_output_tokens"] = min(budget * 2, MAX_OUTPUT_TOKENS)
-                if diagnostic["retryable"]:
-                    run["retry_at"] = time.time() + retry_delay(failures, diagnostic)
-                if run["status"] not in {"paused", "stopped"} and (
-                    not diagnostic["retryable"] or failures >= MAX_CONSECUTIVE_FAILURES
-                ):
-                    run["status"] = "error"
-                if failures >= MAX_CONSECUTIVE_FAILURES:
-                    turn["error"] += " Automatic retries stopped after three consecutive failures."
+                    next_budget = min(budget * 2, MAX_OUTPUT_TOKENS)
+                    run["request_max_output_tokens"] = next_budget
+                    turn["error"] += (
+                        f" The next request will use {next_budget:,} output tokens."
+                        if next_budget > budget
+                        else f" The next request keeps the {next_budget:,}-token budget "
+                        "and asks for one move."
+                    )
+                    run["response_feedback"] = turn["error"]
+                if diagnostic["code"] == "timeout":
+                    timeout = turn.get("timeout_seconds", run["config"]["timeout_seconds"])
+                    run["request_timeout_seconds"] = min(timeout * 2, MAX_TIMEOUT_SECONDS)
+                run["retry_at"] = time.time() + retry_delay(failures, diagnostic)
                 run["error"] = turn["error"]
             elif session:
                 run.update(

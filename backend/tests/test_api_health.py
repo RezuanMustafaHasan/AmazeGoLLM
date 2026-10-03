@@ -510,6 +510,8 @@ def test_incomplete_gateway_completions_never_apply_an_action(health_app, failur
         body["choices"][0]["message"]["refusal"] = "private-ufl-test-key"
     else:
         body["choices"][0]["finish_reason"] = failure
+        if failure == "length":
+            body["choices"][0]["message"]["content"] = '{"arrow_id":'
     reply["body"] = body
     run = client.post(
         "/api/admin/agents",
@@ -539,3 +541,36 @@ def test_incomplete_gateway_completions_never_apply_an_action(health_app, failur
         "content_filter": "refusal",
     }[failure]
     assert turn["diagnostic"]["code"] == expected_code
+
+
+def test_complete_gateway_move_with_length_stop_is_applied_once(health_app):
+    client, _, requests, reply, _ = health_app
+    csrf = login(client)
+    body = completion('{"arrow_id": 1}')
+    body["choices"][0]["finish_reason"] = "length"
+    reply["body"] = body
+    run = client.post(
+        "/api/admin/agents",
+        headers=csrf,
+        json={
+            "name": "Complete length-stop move",
+            "model": "claude-opus-5.5",
+            "thinking_effort": "high",
+            "max_output_tokens": 64000,
+            "start_level": 1,
+            "end_level": 1,
+        },
+    ).json()
+    request_id = str(uuid4())
+    path = f"/api/admin/agents/{run['id']}/step"
+    result = client.post(path, headers=csrf, json={"request_id": request_id}).json()
+    assert result["state"]["moves"] == 1 and result["state"]["status"] == "won"
+    assert result["status"] == "completed" and result["error"] is None
+    assert result["state"]["lives_remaining"] == 3
+    assert client.post(path, headers=csrf, json={"request_id": request_id}).json() == result
+    assert len(requests) == 1
+    sent = json.loads(requests[0].content)
+    assert sent["max_tokens"] == 64000 and sent["output_config"]["effort"] == "high"
+    turn = client.get(f"/api/admin/agents/{run['id']}/turns").json()["items"][0]
+    assert turn["finish_reason"] == "length" and turn["status"] == "finished"
+    assert turn["diagnostic"] is None

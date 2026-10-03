@@ -221,7 +221,7 @@ def test_provider_errors_pause_without_scoring_and_do_not_leak_keys(evaluation, 
     "status,retryable",
     [(400, False), (401, False), (403, False), (404, False), (408, True), (429, True), (503, True)],
 )
-def test_provider_status_diagnostics_backoff_and_retry_budget(
+def test_provider_status_diagnostics_retry_without_limit_and_preserve_progress(
     evaluation, retry_clock, status, retryable
 ):
     _, runner, store = evaluation
@@ -245,22 +245,22 @@ def test_provider_status_diagnostics_backoff_and_retry_budget(
     assert result["diagnostic"]["retryable"] is retryable
     assert "private-test-key" not in json.dumps(result)
     assert result["state"]["lives_remaining"] == 3 and result["state"]["moves"] == 0
-    assert result["status"] == ("running" if retryable else "error")
+    assert result["status"] == "running"
     assert runner.step(run["id"], first_id)["turn_count"] == 1
-    if not retryable:
-        return
-    assert result["retry_at"] == retry_clock[0] + 30
+    assert result["retry_at"] == retry_clock[0] + (30 if retryable else 300)
     assert runner.step(run["id"], str(uuid4()))["turn_count"] == 1
     assert len(calls) == 1
-    for expected in [2, 3]:
-        retry_clock[0] += 31
+    for expected in range(2, 13):
+        retry_clock[0] = result["retry_at"] + 1
         result = runner.step(run["id"], str(uuid4()))
         assert result["consecutive_failures"] == expected
-    assert result["status"] == "error" and len(calls) == 3
-    assert "three consecutive" in result["error"]
+        assert result["status"] == "running"
+        assert result["state"]["moves"] == result["state"]["mistakes"] == 0
+    assert len(calls) == 12
+    assert result["retry_at"] - retry_clock[0] == (60 if retryable else 300)
+    assert "retries stopped" not in result["error"]
     assert store.get_session(run["current_session_id"], run["player_id"])["history"] == []
-    runner.control(run["id"], "resume")
-    retry_clock[0] += 31
+    retry_clock[0] = result["retry_at"] + 1
     runner.invoke = lambda *_: respond('{"arrow_id": 2}')
     recovered = runner.step(run["id"], str(uuid4()))
     assert recovered["state"]["moves"] == 1 and recovered["state"]["lives_remaining"] == 3
@@ -284,14 +284,48 @@ def test_output_exhaustion_increases_budget_and_preserves_state(evaluation, retr
         }
 
     runner.invoke = response
-    for expected in [8192, 16384, 16384]:
+    for expected in [8192, 16384, 32768, 64000, 64000, 64000]:
         result = runner.step(run["id"], str(uuid4()))
         assert result["request_max_output_tokens"] == expected
         assert result["state"]["revision"] == result["state"]["mistakes"] == 0
         assert result["state"]["lives_remaining"] == 3
-        retry_clock[0] += 30
-    assert budgets == [4096, 8192, 16384] and result["status"] == "error"
-    assert efforts == ["max", "max", "max"]
+        assert f"{expected:,}" in result["error"]
+        retry_clock[0] = result["retry_at"] + 1
+    assert budgets == [4096, 8192, 16384, 32768, 64000, 64000]
+    assert result["status"] == "running" and efforts == ["max"] * 6
+    assert "keeps the 64,000-token budget" in result["error"]
+    runner.invoke = lambda *_: respond('{"arrow_id": 2}')
+    recovered = runner.step(run["id"], str(uuid4()))
+    assert recovered["state"]["moves"] == 1 and recovered["consecutive_failures"] == 0
+
+
+@pytest.mark.parametrize("raw", ["", '{"arrow_id":', '{"arrow_id": 999}'])
+def test_length_stops_without_a_valid_move_retry_unscored(evaluation, retry_clock, raw):
+    _, runner, _ = evaluation
+    run = runner.create(
+        CreateAgentRun(
+            **config(model="claude-opus-5.5", thinking_effort="high", max_output_tokens=16384)
+        )
+    )
+    runner.control(run["id"], "resume")
+    runner.invoke = lambda *_: {**respond(raw), "finish_reason": "length"}
+    result = runner.step(run["id"], str(uuid4()))
+    assert result["diagnostic"]["code"] == "output_limit"
+    assert result["status"] == "running" and result["request_max_output_tokens"] == 32768
+    assert (
+        result["state"]["moves"] == result["state"]["mistakes"] == result["state"]["revision"] == 0
+    )
+    assert result["state"]["lives_remaining"] == 3
+    assert result["config"]["thinking_effort"] == "high"
+
+
+def test_agent_allows_ufl_opus_output_ceiling_and_rejects_larger_requests(evaluation):
+    _, runner, store = evaluation
+    run = runner.create(CreateAgentRun(**config(model="claude-opus-5.5", max_output_tokens=64000)))
+    assert run["request_max_output_tokens"] == 64000
+    with pytest.raises(ValueError):
+        CreateAgentRun(**config(max_output_tokens=64001))
+    assert len(store.agent_runs) == 1
 
 
 def test_timeout_then_pause_and_resume_after_runner_restart(evaluation, retry_clock):
@@ -317,6 +351,74 @@ def test_timeout_then_pause_and_resume_after_runner_restart(evaluation, retry_cl
     assert resumed["state"]["lives_remaining"] == 3 and resumed["state"]["moves"] == 1
 
 
+def test_timeouts_increase_allowance_and_eventually_finish_without_admin_resume(
+    evaluation, retry_clock
+):
+    _, runner, store = evaluation
+    run = runner.create(CreateAgentRun(**config(end_level=1, timeout_seconds=90)))
+    runner.control(run["id"], "resume")
+    timeouts = []
+
+    def timeout(config, *_):
+        timeouts.append(config["timeout_seconds"])
+        raise APITimeoutError(request=httpx.Request("POST", "https://ufl.test"))
+
+    runner.invoke = timeout
+    for failure in range(1, 9):
+        result = runner.step(run["id"], str(uuid4()))
+        assert result["status"] == "running" and result["consecutive_failures"] == failure
+        assert result["state"]["lives_remaining"] == 3 and result["state"]["revision"] == 0
+        assert result["request_timeout_seconds"] == 180
+        retry_clock[0] = result["retry_at"] + 1
+    assert timeouts == [90, *([180] * 7)]
+    assert store.list_agent_turns(run["id"])["items"][0]["timeout_seconds"] == 180
+    decisions = iter([2, 1])
+    runner.invoke = lambda *_: respond(json.dumps({"arrow_id": next(decisions)}))
+    recovered = runner.step(run["id"], str(uuid4()))
+    assert recovered["status"] == "running" and recovered["state"]["moves"] == 1
+    assert recovered["consecutive_failures"] == 0 and recovered["retry_at"] is None
+    completed = runner.step(run["id"], str(uuid4()))
+    assert completed["status"] == "completed" and completed["state"]["status"] == "won"
+
+
+@pytest.mark.parametrize("action", ["pause", "stop"])
+def test_admin_control_during_repeated_failures_is_not_overwritten(evaluation, retry_clock, action):
+    _, runner, _ = evaluation
+    run = runner.create(CreateAgentRun(**config()))
+    runner.control(run["id"], "resume")
+
+    def timeout(*_):
+        raise APITimeoutError(request=httpx.Request("POST", "https://ufl.test"))
+
+    runner.invoke = timeout
+    for _ in range(5):
+        result = runner.step(run["id"], str(uuid4()))
+        retry_clock[0] = result["retry_at"] + 1
+
+    def controlled_timeout(*args):
+        runner.control(run["id"], action)
+        timeout(*args)
+
+    runner.invoke = controlled_timeout
+    result = runner.step(run["id"], str(uuid4()))
+    assert result["status"] == ("paused" if action == "pause" else "stopped")
+    assert result["state"]["moves"] == 0 and result["state"]["lives_remaining"] == 3
+
+
+def test_refused_responses_keep_running_with_slow_rechecks(evaluation, retry_clock):
+    _, runner, _ = evaluation
+    run = runner.create(CreateAgentRun(**config()))
+    runner.control(run["id"], "resume")
+    runner.invoke = lambda *_: {**respond(""), "refused": True}
+    for failure in range(1, 6):
+        result = runner.step(run["id"], str(uuid4()))
+        assert result["status"] == "running" and result["consecutive_failures"] == failure
+        assert result["diagnostic"]["code"] == "refusal"
+        assert result["retry_at"] == retry_clock[0] + 300
+        assert result["state"]["moves"] == result["state"]["mistakes"] == 0
+        retry_clock[0] = result["retry_at"] + 1
+
+
 def test_stopped_session_can_resume_existing_board(evaluation):
     _, runner, _ = evaluation
     run = runner.create(CreateAgentRun(**config(end_level=1)))
@@ -339,8 +441,8 @@ def test_detailed_download_includes_every_page_and_excludes_credentials(evaluati
     run = runner.create(CreateAgentRun(**config()))
     runner.invoke = lambda *_: respond("invalid JSON")
     for _ in range(105):
-        runner.step(run["id"], str(uuid4()))
-        retry_clock[0] += 30
+        result = runner.step(run["id"], str(uuid4()))
+        retry_clock[0] = result["retry_at"] + 1
     runner.invoke = lambda *_: respond('{"arrow_id": 2}')
     runner.step(run["id"], str(uuid4()))
     runner.control(run["id"], "stop")
@@ -405,20 +507,31 @@ def test_stop_during_call_discards_pending_action(evaluation):
     assert runner.store.list_agent_turns(run["id"])["items"][0]["status"] == "cancelled"
 
 
-def test_recover_saved_response_after_game_commit_without_recalling_model(evaluation, monkeypatch):
+def test_recover_saved_response_after_game_commit_without_recalling_model(
+    evaluation, monkeypatch, retry_clock
+):
     _, runner, store = evaluation
     run = runner.create(CreateAgentRun(**config()))
+    runner.control(run["id"], "resume")
     calls = []
     runner.invoke = lambda *_: calls.append(1) or respond('{"arrow_id": 2}')
     original = runner._finish
     monkeypatch.setattr(runner, "_finish", lambda *_: (_ for _ in ()).throw(RuntimeError("crash")))
     request_id = str(uuid4())
-    with pytest.raises(RuntimeError, match="crash"):
-        runner.step(run["id"], request_id)
-    assert runner.detail(run["id"])["state"]["moves"] == 1
+    for failure in range(1, 6):
+        with pytest.raises(RuntimeError, match="crash"):
+            runner.step(run["id"], request_id if failure == 1 else str(uuid4()))
+        interrupted = runner.detail(run["id"])
+        assert interrupted["state"]["moves"] == 1 and interrupted["status"] == "running"
+        assert interrupted["consecutive_failures"] == failure
+        assert interrupted["diagnostic"]["code"] == "infrastructure_error"
+        waiting = runner.step(run["id"], request_id)
+        assert waiting["turn_count"] == 0 and len(calls) == 1
+        retry_clock[0] = interrupted["retry_at"] + 1
     monkeypatch.setattr(runner, "_finish", original)
     recovered = runner.step(run["id"], request_id)
     assert recovered["state"]["moves"] == recovered["turn_count"] == 1
+    assert recovered["status"] == "running" and recovered["consecutive_failures"] == 0
     assert len(calls) == 1 and not store.get_agent_run(run["id"])["pending"]
 
 
@@ -443,6 +556,172 @@ def test_range_validation_state_mode_and_turn_limit(evaluation):
     assert result["status"] == "paused" and "turn limit" in result["error"]
     with pytest.raises(GameError, match="turn limit"):
         runner.step(run["id"], str(uuid4()))
+
+
+@pytest.fixture
+def category_evaluation(evaluation):
+    client, runner, store = evaluation
+    template = store.get_level("level-001")
+    entries = [
+        *[(number, "easy") for number in range(2, 36, 3)],
+        (1, "medium"),
+        (7, "expert"),
+        (40, "expert"),
+        (90, "expert"),
+        (41, "hard"),
+    ]
+    store.set_catalog(
+        [
+            template.model_copy(
+                update={
+                    "id": f"level-{number:03}",
+                    "number": number,
+                    "difficulty": difficulty,
+                }
+            )
+            for number, difficulty in reversed(entries)
+        ]
+    )
+    return client, runner, store
+
+
+def category_config(**overrides):
+    return config(
+        selection_mode="category",
+        start_level=None,
+        end_level=None,
+        difficulty="easy",
+        **overrides,
+    )
+
+
+def test_category_first_ten_uses_sorted_matches_and_saves_exact_selection(category_evaluation):
+    client, _, store = category_evaluation
+    csrf = login(client)
+    response = client.post(
+        "/api/admin/agents",
+        headers=csrf,
+        json=category_config(level_limit=10, thinking_effort="max"),
+    )
+    assert response.status_code == 201
+    run = response.json()
+    assert run["level_ids"] == [f"level-{number:03}" for number in range(2, 30, 3)]
+    assert run["state"]["level"]["number"] == 2
+    assert run["config"]["selection_mode"] == "category"
+    assert run["config"]["difficulty"] == "easy" and run["config"]["level_limit"] == 10
+    assert run["config"]["start_level"] is run["config"]["end_level"] is None
+    assert store.get_agent_run(run["id"])["level_ids"] == run["level_ids"]
+    report = client.get(f"/api/admin/agents/{run['id']}/history/download").json()
+    assert report["run"]["level_ids"] == run["level_ids"]
+    assert report["run"]["config"]["difficulty"] == "easy"
+    assert report["run"]["config"]["level_limit"] == 10
+
+
+def test_all_expert_advances_across_gaps_and_completes_only_selected_levels(category_evaluation):
+    client, runner, _ = category_evaluation
+    csrf = login(client)
+    response = client.post(
+        "/api/admin/agents",
+        headers=csrf,
+        json={**category_config(), "difficulty": "expert"},
+    )
+    assert response.status_code == 201
+    run = response.json()
+    assert run["level_ids"] == ["level-007", "level-040", "level-090"]
+    assert run["config"]["level_limit"] is None
+    decisions = iter([2, 1] * 3)
+    runner.invoke = lambda *_: respond(json.dumps({"arrow_id": next(decisions)}))
+    observed = []
+    for _ in range(6):
+        result = step(client, csrf, run).json()
+        observed.append(result["state"]["level"]["number"])
+    assert observed == [7, 7, 40, 40, 90, 90]
+    assert result["status"] == "completed" and len(result["results"]) == 3
+    assert [entry["level_id"] for entry in result["results"]] == run["level_ids"]
+    assert all(entry["status"] == "won" for entry in result["results"])
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"level_limit": 13},  # Only twelve easy problems exist.
+        {"level_limit": 0},
+        {"level_limit": -1},
+        {"level_limit": 1001},
+        {"level_limit": 1.5},
+        {"level_limit": True},
+        {"difficulty": None},
+        {"difficulty": "unknown"},
+        {"start_level": 1},
+        {"end_level": 2},
+        {"selection_mode": "range"},
+    ],
+)
+def test_invalid_category_selections_have_no_side_effects(category_evaluation, overrides):
+    client, _, store = category_evaluation
+    response = client.post(
+        "/api/admin/agents",
+        headers=login(client),
+        json={**category_config(), **overrides},
+    )
+    assert response.status_code == 422
+    assert store.players == {} and store.sessions == {} and store.agent_runs == {}
+
+
+def test_empty_category_is_rejected_before_creating_a_player(evaluation):
+    client, _, store = evaluation
+    response = client.post(
+        "/api/admin/agents",
+        headers=login(client),
+        json={**category_config(), "difficulty": "expert"},
+    )
+    assert response.status_code == 422
+    assert "No expert problems" in response.json()["detail"]
+    assert store.players == {} and store.sessions == {} and store.agent_runs == {}
+
+
+def test_category_all_enforces_the_existing_per_run_limit(evaluation):
+    client, _, store = evaluation
+    template = store.get_level("level-001")
+    store.set_catalog(
+        [
+            template.model_copy(update={"id": f"level-{number:04}", "number": number})
+            for number in range(1, 1002)
+        ]
+    )
+    csrf = login(client)
+    assert (
+        client.post(
+            "/api/admin/agents",
+            headers=csrf,
+            json=category_config(),
+        ).status_code
+        == 422
+    )
+    assert store.players == {} and store.sessions == {} and store.agent_runs == {}
+    response = client.post(
+        "/api/admin/agents",
+        headers=csrf,
+        json=category_config(level_limit=1000),
+    )
+    assert response.status_code == 201 and len(response.json()["level_ids"]) == 1000
+
+
+def test_range_clients_keep_their_selection_and_reject_ambiguous_category_fields(evaluation):
+    client, _, _ = evaluation
+    csrf = login(client)
+    response = client.post("/api/admin/agents", headers=csrf, json=config())
+    assert response.status_code == 201
+    assert response.json()["level_ids"] == ["level-001", "level-002"]
+    assert response.json()["config"]["selection_mode"] == "range"
+    assert (
+        client.post(
+            "/api/admin/agents",
+            headers=csrf,
+            json=config(difficulty="easy"),
+        ).status_code
+        == 422
+    )
 
 
 @pytest.mark.parametrize(

@@ -254,7 +254,7 @@ export default function ApiHealth({ request }: { request: Request }) {
             <input
               type="number"
               min={256}
-              max={16384}
+              max={64000}
               value={outputLimit}
               disabled={busy}
               onChange={(e) => setOutputLimit(Number(e.target.value))}

@@ -91,6 +91,7 @@ export default function Admin() {
   const [username, setUsername] = useState('admin')
   const [password, setPassword] = useState('')
   const [screen, setScreen] = useState<Screen>('overview')
+  const [agentsOpened, setAgentsOpened] = useState(false)
   const [stats, setStats] = useState<Stats | null>(null)
   const [players, setPlayers] = useState<Page<PlayerRecord>>({ items: [], next_cursor: null })
   const [sessions, setSessions] = useState<Page<SessionRecord>>({ items: [], next_cursor: null })
@@ -304,6 +305,7 @@ export default function Admin() {
     }
   }
   function navigate(next: Screen) {
+    if (next === 'agents') setAgentsOpened(true)
     setScreen(next)
     setSearch('')
     setNotice(null)
@@ -624,7 +626,11 @@ export default function Admin() {
               </p>
             </>
           )}
-          {screen === 'agents' && <Agents request={request} />}
+          {agentsOpened && (
+            <div hidden={screen !== 'agents'}>
+              <Agents request={request} />
+            </div>
+          )}
           {screen === 'api-health' && <ApiHealth request={request} />}
           {(screen === 'players' || screen === 'sessions') && (
             <div className="admin-card">

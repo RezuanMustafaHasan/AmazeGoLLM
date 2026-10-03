@@ -1,4 +1,4 @@
-"""Bounded recovery for unscored provider and response failures."""
+"""Persistent recovery with bounded delays for unscored request failures."""
 
 import math
 import time
@@ -7,8 +7,10 @@ from email.utils import parsedate_to_datetime
 
 from backend.app.ufl import safe_error
 
-MAX_CONSECUTIVE_FAILURES = 3
-MAX_OUTPUT_TOKENS = 16384
+MAX_RETRY_DELAY_SECONDS = 60
+ADMIN_RECHECK_SECONDS = 300
+MAX_OUTPUT_TOKENS = 64000
+MAX_TIMEOUT_SECONDS = 180
 
 
 def provider_diagnostic(error):
@@ -40,21 +42,21 @@ def provider_diagnostic(error):
 
 
 def response_diagnostic(turn, token_limit, validation_error=None):
-    if turn.get("finish_reason") == "length" or (
-        not (turn.get("raw_response") or "").strip()
-        and (turn.get("usage", {}).get("output_tokens") or 0) >= token_limit
-    ):
-        return {
-            "code": "output_limit",
-            "message": "The response exhausted its output token budget before a complete action "
-            "was available. The next request will use a larger budget, up to 16384 tokens.",
-            "retryable": True,
-        }
     if turn.get("refused") or turn.get("finish_reason") == "content_filter":
         return {
             "code": "refusal",
             "message": "The provider declined this request. Check model input support.",
             "retryable": False,
+        }
+    empty = not (turn.get("raw_response") or "").strip()
+    if (empty or validation_error) and (
+        turn.get("finish_reason") == "length"
+        or (turn.get("usage", {}).get("output_tokens") or 0) >= token_limit
+    ):
+        return {
+            "code": "output_limit",
+            "message": "The response reached its output token limit before returning a valid move.",
+            "retryable": True,
         }
     if turn.get("response_truncated"):
         return {
@@ -75,7 +77,8 @@ def response_diagnostic(turn, token_limit, validation_error=None):
 
 def retry_delay(failures, diagnostic):
     return max(
-        5 * 2 ** (min(failures, MAX_CONSECUTIVE_FAILURES) - 1),
+        min(5 * 2 ** (min(max(failures, 1), 5) - 1), MAX_RETRY_DELAY_SECONDS),
+        0 if diagnostic["retryable"] else ADMIN_RECHECK_SECONDS,
         diagnostic.get("retry_after_seconds", 0),
     )
 
